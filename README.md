@@ -225,6 +225,9 @@ Either way, **imports and leading docs are always regex** (ctags doesn't model
 them). ctags runs once per build, only over changed files, and never on
 cache-reused files.
 
+> For a fuller reference — how repograph invokes ctags, using ctags directly,
+> its use cases and limits — see [docs/ctags.md](docs/ctags.md).
+
 ### `--symbols` — detail vs. tokens
 
 Because ctags surfaces *far* more symbols (every method and member), a knob
