@@ -112,6 +112,33 @@ Change detection is by **content hash**, so it's robust to fresh clones and
 mtime quirks (the trade-off: every file is still read each run to hash it — the
 saved work is the parsing, not the I/O).
 
+### Keeping the map fresh in your own project
+
+Two helper scripts live in [`tools/`](tools/):
+
+- [`tools/refresh-map.sh`](tools/refresh-map.sh) — incrementally (re)build the
+  index + cache into `<repo>/.repograph/`. Re-run it any time; only changed files
+  are re-analyzed.
+  ```bash
+  tools/refresh-map.sh                     # map the current project
+  tools/refresh-map.sh /path/to/project    # or another one
+  tools/refresh-map.sh . --include 'src/*' # any repograph flag passes through
+  ```
+  It finds `repograph.py` via `$REPOGRAPH_PY`, then a sibling `../repograph.py`,
+  then `PATH` — so set `REPOGRAPH_PY` if you copy the script out of this repo.
+
+- [`tools/install-git-hook.sh`](tools/install-git-hook.sh) — install
+  `post-commit` / `post-merge` / `post-checkout` hooks that run `refresh-map.sh`,
+  so the map updates automatically as the code changes (existing hooks are
+  preserved, not overwritten):
+  ```bash
+  tools/install-git-hook.sh /path/to/project
+  ```
+
+Either commit `.repograph/` (warm, consistent maps for teammates/CI) or add it to
+`.gitignore` (each clone rebuilds once). Agent integrations (the Claude skill and
+the MCP tools) refresh the cache on every call, so they're never stale.
+
 ## What's in the map
 
 - **Overview** — file/line/symbol counts, language breakdown, README blurb.
