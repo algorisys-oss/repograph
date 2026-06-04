@@ -46,6 +46,44 @@ the `REPOMAP.md` lives at the repo root (or you read it from there).
 | `index` | One terse line per file: `path \| lang \| lines \| name:line …`; methods collapse under their owner as `Owner{m:line …}` so the prefix is written once — no docs/links | cheapest LLM routing; ~4× smaller than `md` |
 | `json`  | Compact structured graph (nodes/edges); also the cache schema | feeding tools/agents programmatically |
 
+## Use as an MCP server (optional)
+
+repograph is a CLI first — this is entirely optional. For agent clients that
+prefer calling tools over running shell commands, `repograph_mcp.py` wraps the
+same library as a [Model Context Protocol](https://modelcontextprotocol.io)
+server. It is **stdlib-only too** (no `pip install`, no extra deps) and imports
+repograph in-process, so it runs anywhere `python3` does and works in any MCP
+client (Claude Code, Google Antigravity, Cursor, …). Delete the file and nothing
+else changes.
+
+It exposes two tools:
+
+| Tool | What it does |
+|------|--------------|
+| `repo_index` | Build/refresh the index (cached, incremental) and return it for routing. Args: `path?`, `include?`, `exclude?`, `symbols?`, `no_ctags?`, `rebuild?` |
+| `find_symbol` | Find where a symbol is defined → `path:line  kind  name` rows (exact matches first; finds qualified `Owner.method`). Args: `query`, `path?`, `kind?`, `limit?` |
+
+Register it by pointing any MCP client at `python3 .../repograph_mcp.py`:
+
+```jsonc
+// Claude Code: ~/.claude.json or a project .mcp.json
+// Antigravity: its MCP settings (same schema)
+{
+  "mcpServers": {
+    "repograph": {
+      "command": "python3",
+      "args": ["/path/to/repograph/repograph_mcp.py"]
+    }
+  }
+}
+```
+
+For Claude Code you can also run:
+`claude mcp add repograph -- python3 /path/to/repograph/repograph_mcp.py`.
+
+The server reuses the same per-repo cache under `~/.claude/repograph-cache/`, so
+the first call on a big repo does the full pass and later calls are fast.
+
 ## Incremental updates
 
 Pass `--cache FILE` to keep a JSON snapshot of the graph. On the next run,
