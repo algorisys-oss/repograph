@@ -84,6 +84,22 @@ For Claude Code you can also run:
 The server reuses the same per-repo cache under `~/.claude/repograph-cache/`, so
 the first call on a big repo does the full pass and later calls are fast.
 
+## Use as a Claude skill (optional)
+
+[`skill/SKILL.md`](skill/SKILL.md) packages the "refresh index → read it → jump
+to `path:line`" workflow as a [Claude Code](https://docs.claude.com/en/docs/claude-code)
+skill, so the agent reaches for repograph automatically when you ask "where is
+X?" / "what's in this repo?". Install it:
+
+```bash
+mkdir -p ~/.claude/skills/repograph
+cp skill/SKILL.md ~/.claude/skills/repograph/
+# point the skill at this checkout (or put repograph.py on your PATH):
+export REPOGRAPH_PY="$PWD/repograph.py"
+```
+
+It's optional and self-contained — it just drives the CLI described above.
+
 ## Incremental updates
 
 Pass `--cache FILE` to keep a JSON snapshot of the graph. On the next run,
@@ -227,3 +243,7 @@ python repograph.py /path/to/ziglang/zig \
   there's still no call graph or type resolution (a much harder, research-grade
   problem). tree-sitter grammars would be the next step there, at the cost of
   the zero-dependency simplicity.
+
+## License
+
+[MIT](LICENSE) © 2026 Rajesh Pillai

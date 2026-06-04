@@ -15,7 +15,7 @@ It is **not** a learning exercise — it's a utility wanted soon. (It started li
 inside a Zig-from-first-principles learning project, then moved here to
 `ai-tools/` as a standalone tool. It has no dependency on that project.)
 
-## Status: working, 27 tests passing
+## Status: working, 28 tests passing
 
 ```bash
 python repograph.py <repo> -f index -o MAP        # run
@@ -87,7 +87,12 @@ included and qualified as `Owner.method`; ~150 langs), else the original
 regex, `--ctags-path BIN` overrides the binary. ctags runs once per build, only
 over changed files, never on cache-reused files. **Imports + leading docs stay
 regex always** (ctags doesn't model them). Detection rejects Exuberant Ctags
-(no JSON). Implemented in `ctags_available` / `run_ctags` / `_qualify`; wired
+(no JSON). **Kind nuance:** some languages (Python, …) tag class methods as
+kind `member` (not `method`); `run_ctags` promotes a `member` to `method` (so it's
+qualified + kept at `defs`) only when its `scopeKind` is an OO container
+(class/interface/trait/module/object — see `_CLASS_SCOPE_KINDS`), so C/struct
+data fields (scopeKind `struct`) correctly stay fields. Implemented in
+`ctags_available` / `run_ctags` / `_qualify`; wired
 through `analyze_bytes`→`process_file`→`build_repo` (two-phase: hash/triage, then
 one batch ctags call). ctags is **not installed on this machine** → the live
 path here is the regex fallback; the ctags path is covered by stubbed tests and

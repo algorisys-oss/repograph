@@ -289,6 +289,30 @@ class CtagsTest(unittest.TestCase):
             full = rg.run_ctags(["/x/a.ts"], "full")
         self.assertTrue(any(s.name == "_field" for s in full["/x/a.ts"]))
 
+    def test_ctags_member_promotion_by_scopekind(self):
+        """A 'member' in a class (Python-style) becomes a qualified method;
+        a 'member' in a struct (C-style data field) stays a field."""
+        import json
+        stdout = "\n".join([
+            json.dumps({"_type": "tag", "name": "C", "path": "/p", "line": 1,
+                        "kind": "class"}),
+            json.dumps({"_type": "tag", "name": "m", "path": "/p", "line": 4,
+                        "kind": "member", "scope": "C", "scopeKind": "class"}),
+            json.dumps({"_type": "tag", "name": "x", "path": "/p", "line": 8,
+                        "kind": "member", "scope": "Pt", "scopeKind": "struct"}),
+        ]) + "\n"
+        with unittest.mock.patch.object(rg.subprocess, "run", self._fake_run(stdout)):
+            defs = rg.run_ctags(["/p"], "defs")["/p"]
+        d = {(s.name, s.kind) for s in defs}
+        self.assertIn(("C.m", "method"), d)        # class member → qualified method
+        self.assertNotIn(("x", "member"), d)       # struct field dropped at defs
+        self.assertFalse(any(s.name == "x" for s in defs))
+        with unittest.mock.patch.object(rg.subprocess, "run", self._fake_run(stdout)):
+            full = rg.run_ctags(["/p"], "full")["/p"]
+        self.assertTrue(any(s.name == "x" and s.kind == "member" for s in full))
+        # The struct field is never promoted to a method, even at full.
+        self.assertFalse(any(s.name == "Pt.x" for s in full))
+
     def test_run_ctags_dedupes_and_sorts(self):
         import json
         stdout = "\n".join([

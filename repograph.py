@@ -236,6 +236,14 @@ CTAGS_KIND_MAP = {
 # Kinds that are method-like — qualified with their owning scope (Owner.name).
 _METHOD_KINDS = {"method"}
 
+# scopeKinds that mark an OO container. Some languages (Python, …) tag class
+# methods as kind "member" rather than "method"; we promote a member to a method
+# only when its owner is one of these — NOT struct/union, whose members are data
+# fields (e.g. C struct fields), which must stay fields (dropped at "defs").
+_CLASS_SCOPE_KINDS = {
+    "class", "interface", "trait", "module", "object", "mixin", "role",
+}
+
 # Kinds kept at the default --symbols=defs level. High-cardinality members and
 # fields are dropped here (they explode the index) and only kept at "full".
 _DEFAULT_KINDS = {
@@ -435,14 +443,21 @@ def run_ctags(abs_paths, symbols_level: str) -> "dict[str, list[Symbol]]":
         line = rec.get("line")
         if not path or not name or not isinstance(line, int):
             continue
+        scope = rec.get("scope") or ""
+        scope_kind = (rec.get("scopeKind") or "").lower()
         kind = CTAGS_KIND_MAP.get((rec.get("kind") or "").lower(),
                                   (rec.get("kind") or "").lower())
         if not kind:
             continue
+        # Languages like Python tag class methods as "member"; promote those to
+        # "method" so they're qualified and kept at "defs". Struct/union members
+        # (data fields) are NOT promoted — their scopeKind isn't a class.
+        if kind == "member" and scope and scope_kind in _CLASS_SCOPE_KINDS:
+            kind = "method"
         if kind not in _DEFAULT_KINDS and not keep_members:
             continue
         if kind in _METHOD_KINDS:
-            name = _qualify(name, rec.get("scope") or "")
+            name = _qualify(name, scope)
         out.setdefault(path, []).append(Symbol(name=name, kind=kind, line=line))
 
     for path, syms in out.items():
