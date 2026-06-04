@@ -115,6 +115,11 @@ verbatim** (skipping the regex work); only changed files are re-analyzed and
 deleted files are dropped. It prints `Updated: N changed, M reused, K removed`.
 Use `--rebuild` to ignore the cache and analyze everything.
 
+The cache is **profile-aware**: each entry records the `--symbols` level and
+whether ctags produced it, so changing `--symbols` (or installing/removing
+ctags) automatically re-analyzes the affected files instead of serving stale
+symbols — no `--rebuild` needed.
+
 Change detection is by **content hash**, so it's robust to fresh clones and
 mtime quirks. In a **git repo** there's a fast path: repograph compares each
 tracked file's git blob sha (from `git ls-files -s`, no file read) against the
@@ -244,9 +249,14 @@ the token win intact while fixing the missing-methods gap.
 
 ## How it walks a repo
 
-- If the directory is a git repo, it uses `git ls-files` (so `.gitignore` is
-  respected). Otherwise it walks the tree, skipping common noise dirs
-  (`.git`, `node_modules`, `__pycache__`, `target`, `.zig-cache`, …).
+- If the directory is a git repo, it uses
+  `git ls-files --cached --others --exclude-standard` — i.e. tracked **and**
+  untracked files, while honoring `.gitignore` (so a new, not-yet-committed file
+  shows up, but ignored ones don't). Otherwise it walks the tree, skipping
+  common noise dirs (`.git`, `node_modules`, `__pycache__`, `target`,
+  `.zig-cache`, …).
+- repograph's own `.repograph/` output dir is always skipped (it never indexes
+  the map/cache it just wrote).
 - Binary files (NUL-byte sniff) and files over ~2 MB are skipped.
 
 ## Tests

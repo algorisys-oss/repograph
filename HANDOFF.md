@@ -15,7 +15,7 @@ It is **not** a learning exercise — it's a utility wanted soon. (It started li
 inside a Zig-from-first-principles learning project, then moved here to
 `ai-tools/` as a standalone tool. It has no dependency on that project.)
 
-## Status: working, 38 tests passing
+## Status: working, 45 tests passing
 
 ```bash
 python repograph.py <repo> -f index -o MAP        # run
@@ -103,6 +103,15 @@ default `defs` (top-level defs + qualified methods, drops members/fields); the
 index groups methods under their owner as `Owner{m:line …}` so the class prefix
 is written once; per-file symbol cap `MAX_SYMBOLS_PER_FILE` (80) with `+N more`.
 Net: the methods gap is fixed while the index stays ~flat in size.
+
+### Review fixes (2026-06-04)
+Three reviewed defects fixed: (1) **cache profile-awareness** — `FileNode.build_key`
+= `"<symbols_level>:<ctags?>"`, checked on both reuse branches in `build_repo`, so
+changing `--symbols`/backend re-analyzes instead of serving stale symbols
+(serialized as `bk`); (2) `.repograph` added to `NOISE_DIRS` **and** filtered in
+`list_files` so repograph never indexes its own output; (3) `list_files` now uses
+`git ls-files --cached --others --exclude-standard` to include untracked,
+non-ignored files (still respects `.gitignore`).
 
 ### git-status fast path (2026-06-04)
 In a git repo, `build_repo` reuses unchanged tracked files **without reading

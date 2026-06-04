@@ -202,6 +202,7 @@ NOISE_DIRS = {
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
     "dist", "build", "target", ".zig-cache", "zig-cache", "vendor", ".idea",
     ".vscode", ".mypy_cache", ".pytest_cache", "__snapshots__",
+    ".repograph",  # repograph's own generated index/cache — never index it
 }
 
 MAX_FILE_BYTES = 2_000_000  # skip files larger than this
@@ -276,6 +277,7 @@ class FileNode:
     line_count: int
     content_hash: str = "" # sha1 of file bytes — drives incremental update
     gitsha: str = ""       # git blob sha (when tracked) — git-status fast path
+    build_key: str = ""    # "<symbols_level>:<ctags?>" — invalidates reuse on change
     doc: str = ""          # leading comment/docstring, trimmed
     symbols: list = field(default_factory=list)   # list[Symbol]
     imports: list = field(default_factory=list)   # list[str]
@@ -301,17 +303,22 @@ class Repo:
 def list_files(root: Path) -> "list[Path]":
     """Return repo files as absolute paths.
 
-    Prefer `git ls-files` (respects .gitignore) when root is a git repo;
-    otherwise os.walk while skipping noise directories.
+    Prefer git when root is a git repo: `git ls-files --cached --others
+    --exclude-standard` lists tracked *and* untracked-not-ignored files, so the
+    map reflects new working-tree files while still honoring .gitignore.
+    Otherwise os.walk while skipping noise directories. repograph's own
+    `.repograph/` artifacts are always excluded (see NOISE_DIRS).
     """
     if (root / ".git").exists():
         try:
             out = subprocess.run(
-                ["git", "-C", str(root), "ls-files", "-z"],
+                ["git", "-C", str(root), "ls-files", "-z",
+                 "--cached", "--others", "--exclude-standard"],
                 capture_output=True, check=True,
             )
             rels = out.stdout.decode("utf-8", "replace").split("\0")
-            return [root / r for r in rels if r]
+            return [root / r for r in rels
+                    if r and ".repograph" not in Path(r).parts]
         except (subprocess.CalledProcessError, FileNotFoundError):
             pass  # git missing or not a real repo — fall back to walk
 
@@ -705,6 +712,12 @@ def build_repo(root: Path, include=None, exclude=None, cache=None,
     blob = git_blob_shas(root)                 # None when not a git repo
     dirty = git_dirty_files(root) if blob is not None else set()
 
+    # A cached node is only reusable if it was produced under the same symbol
+    # profile (level + effective backend); otherwise its symbols are stale, so
+    # we re-analyze. ctags_effective is computed once and reused for Phase B.
+    ctags_effective = (use_ctags and symbols_level != "none" and ctags_available())
+    want_key = f"{symbols_level}:{int(ctags_effective)}"
+
     # Phase A — select, detect changes, reuse from cache. Defer analysis of
     # changed files so ctags can run over them in a single batch (Phase B).
     pending: "list[tuple]" = []  # (path, rel, ext, data, digest, gitsha)
@@ -717,14 +730,15 @@ def build_repo(root: Path, include=None, exclude=None, cache=None,
         if not path_selected(rel, include, exclude):
             continue
         cached = cache.get(rel)
+        reusable = cached is not None and cached.build_key == want_key
         cur_gitsha = blob.get(rel) if blob is not None else None
 
-        if (cur_gitsha and rel not in dirty and cached is not None
+        if (reusable and cur_gitsha and rel not in dirty
                 and cached.gitsha == cur_gitsha):
             seen.add(rel)
             order.append(rel)
             reused[rel] = cached
-            continue  # unchanged per git — no file read
+            continue  # unchanged per git, same profile — no file read
 
         read = read_file_bytes(path)
         if read is None:
@@ -732,7 +746,7 @@ def build_repo(root: Path, include=None, exclude=None, cache=None,
         data, digest = read
         seen.add(rel)
         order.append(rel)
-        if cached is not None and cached.content_hash == digest:
+        if reusable and cached.content_hash == digest:
             if cur_gitsha:
                 cached.gitsha = cur_gitsha  # learn blob sha for next-run fast path
             reused[rel] = cached
@@ -742,7 +756,7 @@ def build_repo(root: Path, include=None, exclude=None, cache=None,
 
     # Phase B — one batch ctags call over the changed files with a known language.
     ctags_syms: "dict[str, list[Symbol]]" = {}
-    if use_ctags and symbols_level != "none" and ctags_available():
+    if ctags_effective:
         abs_for_ctags = [
             str(p) for (p, _rel, ext, _d, _h, _g) in pending if EXT_TO_LANG.get(ext)
         ]
@@ -754,6 +768,7 @@ def build_repo(root: Path, include=None, exclude=None, cache=None,
         cs = ctags_syms.get(str(path))
         node = analyze_bytes(rel, ext, data, digest, cs, symbols_level)
         node.gitsha = gitsha
+        node.build_key = want_key
         analyzed[rel] = node
 
     for rel in order:
@@ -789,6 +804,8 @@ def repo_to_dict(repo: Repo) -> dict:
         }
         if f.gitsha:  # omit when absent (non-git) to keep the artifact lean
             d["gitsha"] = f.gitsha
+        if f.build_key:
+            d["bk"] = f.build_key
         return d
 
     return {
@@ -807,6 +824,7 @@ def files_from_dict(d: dict) -> "dict[str, FileNode]":
             line_count=fd.get("lines", 0),
             content_hash=fd.get("hash", ""),
             gitsha=fd.get("gitsha", ""),
+            build_key=fd.get("bk", ""),
             doc=fd.get("doc", ""),
             symbols=[Symbol(**s) for s in fd.get("symbols", [])],
             imports=list(fd.get("imports", [])),

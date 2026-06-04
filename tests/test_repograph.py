@@ -207,9 +207,12 @@ class RepoGraphTest(unittest.TestCase):
         self.assertTrue(app.content_hash)  # hash is populated
 
     def test_incremental_reuses_unchanged_and_reanalyzes_changed(self):
+        # Use the same backend as setUp (use_ctags=False) so the cached nodes'
+        # build profile matches and reuse is exercised (see test_cache_* below
+        # for the profile-change invalidation path).
         cache = {f.rel_path: f for f in self.repo.files}
         # Re-run with the full cache, nothing changed → everything reused.
-        again = rg.build_repo(self.root, cache=cache)
+        again = rg.build_repo(self.root, cache=cache, use_ctags=False)
         self.assertEqual(again.analyzed, 0)
         self.assertEqual(again.reused, len(self.repo.files))
         self.assertEqual(again.dropped, 0)
@@ -220,7 +223,7 @@ class RepoGraphTest(unittest.TestCase):
         )
         (self.root / "lib" / "widget.js").unlink()
         cache = {f.rel_path: f for f in again.files}
-        third = rg.build_repo(self.root, cache=cache)
+        third = rg.build_repo(self.root, cache=cache, use_ctags=False)
         by_path = {f.rel_path: f for f in third.files}
         self.assertEqual(third.analyzed, 1)            # only app.py re-analyzed
         self.assertEqual(third.dropped, 1)             # widget.js gone
@@ -523,6 +526,78 @@ class GitFastPathTest(unittest.TestCase):
         self.assertEqual(again.analyzed, 1)
         by = {f.rel_path: f for f in again.files}
         self.assertEqual({s.name for s in by["x.py"].symbols}, {"a", "z"})
+
+    def test_untracked_included_ignored_and_artifacts_excluded(self):
+        (self.root / "new.py").write_text("def n():\n    pass\n")     # untracked
+        (self.root / "ign.py").write_text("def g():\n    pass\n")     # ignored
+        (self.root / ".gitignore").write_text("ign.py\n")
+        (self.root / ".repograph").mkdir()
+        (self.root / ".repograph" / "map.index").write_text("x | - | 1 |\n")
+        paths = {f.rel_path for f in rg.build_repo(self.root, use_ctags=False).files}
+        self.assertIn("x.py", paths)                 # tracked
+        self.assertIn("new.py", paths)               # untracked, not ignored
+        self.assertNotIn("ign.py", paths)            # gitignored → excluded
+        self.assertNotIn(".repograph/map.index", paths)  # own artifact → excluded
+
+
+class ReviewFixTest(unittest.TestCase):
+    """Regression tests for the reviewed findings (cache profile + artifacts)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "a.py").write_text(
+            "def a():\n    pass\nclass C:\n    def m(self):\n        pass\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_cache_symbols_none_clears_stale_symbols(self):
+        first = rg.build_repo(self.root, use_ctags=False, symbols_level="defs")
+        self.assertTrue([s for f in first.files for s in f.symbols])
+        cache = {f.rel_path: f for f in first.files}
+        again = rg.build_repo(self.root, cache=cache, use_ctags=False,
+                              symbols_level="none")
+        self.assertEqual(again.analyzed, 1)     # re-analyzed, not reused stale
+        self.assertEqual([s for f in again.files for s in f.symbols], [])
+
+    def test_cache_level_change_reanalyzes(self):
+        first = rg.build_repo(self.root, use_ctags=False, symbols_level="defs")
+        cache = {f.rel_path: f for f in first.files}
+        again = rg.build_repo(self.root, cache=cache, use_ctags=False,
+                              symbols_level="full")
+        self.assertEqual(again.reused, 0)       # profile changed → nothing reused
+
+    def test_cache_without_build_key_reanalyzes(self):
+        # Simulate a pre-build_key (old) cache: node present, build_key empty.
+        first = rg.build_repo(self.root, use_ctags=False)
+        node = first.files[0]
+        node.build_key = ""
+        again = rg.build_repo(self.root, cache={node.rel_path: node},
+                              use_ctags=False)
+        self.assertEqual(again.analyzed, 1)     # mismatch → re-analyze, no crash
+        self.assertTrue([s for f in again.files for s in f.symbols])
+
+    def test_cache_same_profile_reuses(self):
+        first = rg.build_repo(self.root, use_ctags=False, symbols_level="defs")
+        cache = {f.rel_path: f for f in first.files}
+        again = rg.build_repo(self.root, cache=cache, use_ctags=False,
+                              symbols_level="defs")
+        self.assertEqual(again.reused, len(first.files))
+        self.assertEqual(again.analyzed, 0)
+
+    def test_build_key_round_trips_through_cache_json(self):
+        repo = rg.build_repo(self.root, use_ctags=False)
+        files = rg.files_from_dict(rg.repo_to_dict(repo))
+        self.assertEqual(files["a.py"].build_key, "defs:0")
+
+    def test_repograph_artifacts_not_indexed_non_git(self):
+        (self.root / ".repograph").mkdir()
+        (self.root / ".repograph" / "map.index").write_text("x | - | 1 |\n")
+        (self.root / ".repograph" / "map.graph.json").write_text("{}\n")
+        paths = {f.rel_path for f in rg.build_repo(self.root, use_ctags=False).files}
+        self.assertIn("a.py", paths)
+        self.assertFalse(any(p.startswith(".repograph/") for p in paths))
 
 
 if __name__ == "__main__":
