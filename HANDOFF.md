@@ -15,7 +15,7 @@ It is **not** a learning exercise — it's a utility wanted soon. (It started li
 inside a Zig-from-first-principles learning project, then moved here to
 `ai-tools/` as a standalone tool. It has no dependency on that project.)
 
-## Status: working, 28 tests passing
+## Status: working, 38 tests passing
 
 ```bash
 python repograph.py <repo> -f index -o MAP        # run
@@ -94,9 +94,9 @@ qualified + kept at `defs`) only when its `scopeKind` is an OO container
 data fields (scopeKind `struct`) correctly stay fields. Implemented in
 `ctags_available` / `run_ctags` / `_qualify`; wired
 through `analyze_bytes`→`process_file`→`build_repo` (two-phase: hash/triage, then
-one batch ctags call). ctags is **not installed on this machine** → the live
-path here is the regex fallback; the ctags path is covered by stubbed tests and
-was verified end-to-end against a fake universal-ctags binary.
+one batch ctags call). universal-ctags **is installed** now (5.9.0) → it's the
+live backend; the regex path is covered by stubbed tests + verified by forcing
+`--no-ctags`.
 
 **Token guardrails** (the reduced-tokens goal): `--symbols {none,defs,full}`,
 default `defs` (top-level defs + qualified methods, drops members/fields); the
@@ -104,21 +104,41 @@ index groups methods under their owner as `Owner{m:line …}` so the class prefi
 is written once; per-file symbol cap `MAX_SYMBOLS_PER_FILE` (80) with `+N more`.
 Net: the methods gap is fixed while the index stays ~flat in size.
 
+### git-status fast path (2026-06-04)
+In a git repo, `build_repo` reuses unchanged tracked files **without reading
+them**: `git_blob_shas` (from `git ls-files -s`) gives each file's blob sha, and
+a tracked, non-dirty file (`git_dirty_files` via `git status --porcelain`) whose
+cached `gitsha` matches is reused as-is. New `gitsha` field on `FileNode`
+(serialized only when present). Non-git repos fall back to read+hash. So warm
+runs on large repos skip the per-file hashing I/O, not just parsing.
+
+### Query layer (2026-06-04)
+Library funcs in `repograph.py`: `find_symbol` (def lookup), `search_symbols`
+(lexical "by intent" — `tokenize` splits camelCase/snake, ranks by name+doc word
+overlap; NOT embeddings), `find_refs` (lexical usages via git grep, else stdlib
+scan; approximate, flags def sites). Exposed as CLI `--find/--search/--refs` and
+as MCP tools `find_symbol`/`search`/`find_refs` (repograph_mcp.py reuses the same
+funcs). These widen usefulness toward "who calls this" / "by intent" without
+adding deps; honest limits below.
+
 ### Honest limits (still)
 - Without universal-ctags, the **regex fallback** misses JS/TS/Java methods and
   doesn't qualify names (install ctags to fix). CJS `module.exports = {…}` names
   still aren't pulled out by the regex path.
 - `.vue/.svelte/.heex/.eex` templates get a file node but no symbols.
-- Imports are always regex (weakest layer). No type resolution, no call graph,
-  no cross-file reference edges — tree-sitter is the next step there.
+- Imports are always regex (weakest layer). No type resolution, no *resolved*
+  call graph — `find_refs` gives **lexical** usages (name-based, can't tell
+  `a.connect()` from `b.connect()`); `search` gives **lexical** by-intent
+  (word/doc overlap, not semantic). tree-sitter (resolved refs) / embeddings
+  (true semantic) are the next steps, deliberately left out to keep zero-dep.
 
 ## Open threads / next steps
 
-1. **examples/ cleanup (undecided).** `examples/ziglang-zig.repomap.md` (1.6 MB)
-   + `ziglang-zig.graph.json` (1.5 MB) are ~3 MB of regenerable, zig-specific
-   output that rode along in the move. Recommendation: delete both and let the
-   README's generate-command stand (or replace with a tiny self-example). README
-   currently references them, so trim that section if removed.
+1. **examples/ cleanup — DONE** (2026-06-04). User deleted the regenerable zig
+   output; empty `examples/` dir removed; README example section de-linked.
+   **Published:** repo is on GitHub at `algorisys-oss/repograph` (MIT, branch
+   `main`); `tools/refresh-map.sh` + `tools/install-git-hook.sh` keep a project's
+   map fresh; `tools/token-bench.py` measures the symbol-lookup token win.
 2. **Claude skill — BUILT** (2026-06-04). Personal skill at
    `~/.claude/skills/repograph/SKILL.md`. Workflow: default to cwd → refresh a
    per-repo `--cache` index under `~/.claude/repograph-cache/<slug>.{json,index}`
@@ -131,12 +151,13 @@ Net: the methods gap is fixed while the index stays ~flat in size.
    (embeddings + BM25) and adds only a Go structural layer; repograph is
    *language-agnostic, zero-dependency, regex-structural* mapping. Different
    axes (map vs. search) — keep both; no reason to fold one into the other.
-4. **Accuracy upgrades — ctags DONE** (2026-06-04, see "Symbol backend" above):
-   optional universal-ctags backend gives precise symbols incl. qualified
-   class/methods, with regex fallback. Still open if needed: git-status fast
-   path for change detection on huge repos; a **tree-sitter** backend for type
-   resolution / call graph / cross-file reference edges (the things ctags also
-   can't give us); CJS `module.exports` names in the regex path.
+4. **Accuracy upgrades — ctags + git fast path + query layer DONE** (2026-06-04):
+   universal-ctags backend (qualified methods); git-status fast path; lexical
+   `find_symbol`/`search`/`find_refs`. Still open if needed: a **tree-sitter**
+   backend for *resolved* refs/call-graph/types, and **embeddings** for *true*
+   semantic search (both deliberately deferred — they'd break zero-dep; the plan
+   is to compose with an LSP / embedding index rather than rebuild them). CJS
+   `module.exports` names in the regex path also still missing.
 
 ## Pointers
 

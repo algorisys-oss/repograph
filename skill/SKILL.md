@@ -114,12 +114,29 @@ index); `--symbols none` drops symbols entirely. Imports/docs are always regex.
 - Treat the index as a high-recall router, not ground truth: if a symbol isn't
   listed, fall back to a scoped grep in the file the index points you to.
 
+## Quick lookups (CLI query modes)
+
+Instead of reading the whole index, you can ask repograph directly (it builds
+via `--cache` first, then prints just the answer):
+
+```bash
+python3 "$REPOGRAPH_PY" . --find build_repo         # where is a symbol DEFINED
+python3 "$REPOGRAPH_PY" . --search "parse message"  # rank symbols by name/doc words
+python3 "$REPOGRAPH_PY" . --refs handleClick        # where a name is USED (approx.)
+```
+
+- `--find` — exact/substring symbol definition lookup → `path:line kind name`.
+- `--search` — lexical "by intent": matches query words against symbol names and
+  file doc comments (not semantic — won't find concepts not named anywhere).
+- `--refs` — lexical usages (git grep under the hood); name-based, so approximate
+  (can't tell `a.connect()` from `b.connect()`). Use for "who references X".
+
 ## Optional: MCP server
 
 This skill drives the CLI directly — that's all you need. Optionally, the same
 library is wrapped as a stdlib-only MCP server (`repograph_mcp.py` in the repo)
-exposing `repo_index` and `find_symbol` tools, for MCP clients (e.g. Google
-Antigravity) or sessions where calling a tool beats shelling out. If the
-`repograph` MCP tools are available in your session, prefer `find_symbol` for
-"where is X" and `repo_index` for routing. See the README's "Use as an MCP
-server" section to register it.
+exposing four tools — `repo_index`, `find_symbol`, `search`, `find_refs` — for
+MCP clients (e.g. Google Antigravity) or sessions where calling a tool beats
+shelling out. If the `repograph` MCP tools are available, prefer `find_symbol`
+for "where is X defined", `search` for by-intent, `find_refs` for "who uses X",
+and `repo_index` for routing. See the README's "Use as an MCP server" section.

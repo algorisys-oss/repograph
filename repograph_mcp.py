@@ -73,32 +73,40 @@ def tool_repo_index(args) -> str:
     return f"# {stats}\n\n" + rg.render_index(repo)
 
 
+def _build_for_query(args):
+    return _build(
+        args.get("path"), args.get("include"), args.get("exclude"),
+        args.get("symbols", "defs"), bool(args.get("no_ctags")), False,
+    )
+
+
 def tool_find_symbol(args) -> str:
     query = (args.get("query") or "").strip()
     if not query:
         raise ValueError("'query' is required")
-    kind = args.get("kind")
-    limit = int(args.get("limit", 50))
-    repo = _build(
-        args.get("path"), args.get("include"), args.get("exclude"),
-        args.get("symbols", "defs"), bool(args.get("no_ctags")), False,
-    )
-    q = query.lower()
-    rows = []
-    for f in repo.files:
-        for s in f.symbols:
-            if kind and s.kind != kind:
-                continue
-            if q in s.name.lower():
-                rows.append((s.name.lower() != q, f.rel_path, s.line, s.kind, s.name))
-    rows.sort()  # exact matches first (False < True), then by path/line
-    if not rows:
-        return f"No symbol matching {query!r} found."
-    out = [f"{r[1]}:{r[2]}  {r[3]}  {r[4]}" for r in rows[:limit]]
-    more = len(rows) - len(out)
-    if more > 0:
-        out.append(f"... (+{more} more; raise 'limit' or refine 'query')")
-    return "\n".join(out)
+    repo = _build_for_query(args)
+    rows = rg.find_symbol(repo, query, kind=args.get("kind"),
+                          limit=int(args.get("limit", 50)))
+    return rg.format_symbol_rows(rows)
+
+
+def tool_search(args) -> str:
+    query = (args.get("query") or "").strip()
+    if not query:
+        raise ValueError("'query' is required")
+    repo = _build_for_query(args)
+    rows = rg.search_symbols(repo, query, limit=int(args.get("limit", 30)))
+    return rg.format_search_rows(rows)
+
+
+def tool_find_refs(args) -> str:
+    name = (args.get("name") or "").strip()
+    if not name:
+        raise ValueError("'name' is required")
+    repo = _build_for_query(args)
+    rows = rg.find_refs(repo.root, name, limit=int(args.get("limit", 80)),
+                        definitions=rg.def_locations(repo))
+    return rg.format_ref_rows(rows)
 
 
 TOOLS = [
@@ -151,9 +159,60 @@ TOOLS = [
             "required": ["query"],
         },
     },
+    {
+        "name": "search",
+        "description": (
+            "Lexical 'by intent' symbol search: ranks symbols by word-token "
+            "overlap of the query with symbol names AND file doc comments "
+            "(e.g. 'retry request' finds retryRequest / a fn documented 'retries "
+            "on 5xx'). Returns `path:line kind name (score)`. NOT semantic — it "
+            "matches words in names/docs, not meaning; fall back to grep for "
+            "concepts not named anywhere."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "intent words, e.g. 'parse websocket message'"},
+                "path": {"type": "string", "description": "Repo dir (default: cwd)"},
+                "limit": {"type": "integer", "description": "max rows (default 30)"},
+                "include": {"type": "array", "items": {"type": "string"}},
+                "exclude": {"type": "array", "items": {"type": "string"}},
+                "no_ctags": {"type": "boolean"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "find_refs",
+        "description": (
+            "Find where an identifier is USED (lexical, word-boundary; git grep "
+            "under the hood). Returns `path:line  [def]  text`, with the "
+            "definition site flagged. Approximate — it's name-based, so it can't "
+            "tell a.connect() from b.connect() and may include comments/strings. "
+            "Use find_symbol for definitions; use this for 'who references X'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "identifier to find usages of"},
+                "path": {"type": "string", "description": "Repo dir (default: cwd)"},
+                "limit": {"type": "integer", "description": "max rows (default 80)"},
+                "include": {"type": "array", "items": {"type": "string"}},
+                "exclude": {"type": "array", "items": {"type": "string"}},
+                "no_ctags": {"type": "boolean"},
+            },
+            "required": ["name"],
+        },
+    },
 ]
 
-DISPATCH = {"repo_index": tool_repo_index, "find_symbol": tool_find_symbol}
+DISPATCH = {
+    "repo_index": tool_repo_index,
+    "find_symbol": tool_find_symbol,
+    "search": tool_search,
+    "find_refs": tool_find_refs,
+}
 
 
 # --------------------------------------------------------------------------- #

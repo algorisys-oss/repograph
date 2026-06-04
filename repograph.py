@@ -275,6 +275,7 @@ class FileNode:
     language: str          # language name or "" if unknown
     line_count: int
     content_hash: str = "" # sha1 of file bytes — drives incremental update
+    gitsha: str = ""       # git blob sha (when tracked) — git-status fast path
     doc: str = ""          # leading comment/docstring, trimmed
     symbols: list = field(default_factory=list)   # list[Symbol]
     imports: list = field(default_factory=list)   # list[str]
@@ -320,6 +321,67 @@ def list_files(root: Path) -> "list[Path]":
         for fn in filenames:
             found.append(Path(dirpath) / fn)
     return found
+
+
+def git_blob_shas(root: Path) -> "dict[str, str] | None":
+    """{rel_path: git blob sha} for tracked files, or None if not a git repo.
+
+    `git ls-files -s` reports each file's blob object id *as recorded in the
+    index* — a content fingerprint we can read without opening the file. This
+    powers the change-detection fast path: an unchanged tracked file keeps its
+    blob sha, so we can reuse its cached node without reading + hashing it.
+    """
+    if not (root / ".git").exists():
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-s", "-z"],
+            capture_output=True, check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    shas: "dict[str, str]" = {}
+    for entry in out.stdout.decode("utf-8", "replace").split("\0"):
+        if not entry:
+            continue
+        # format: "<mode> <objectid> <stage>\t<path>"
+        meta, _, path = entry.partition("\t")
+        parts = meta.split()
+        if path and len(parts) >= 2:
+            shas[path] = parts[1]
+    return shas
+
+
+def git_dirty_files(root: Path) -> "set[str]":
+    """Tracked paths whose working tree differs from the index (porcelain).
+
+    The index blob sha (from git_blob_shas) is stale for files with unstaged
+    edits; those show up here, so we fall back to reading + hashing them.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain", "-z",
+             "--untracked-files=no"],
+            capture_output=True, check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return set()
+    dirty: "set[str]" = set()
+    # -z records are NUL-separated; "XY <path>" (rename adds a second NUL field).
+    fields = out.stdout.decode("utf-8", "replace").split("\0")
+    i = 0
+    while i < len(fields):
+        rec = fields[i]
+        if not rec:
+            i += 1
+            continue
+        status, path = rec[:2], rec[3:]
+        if path:
+            dirty.add(path)
+        if "R" in status:  # rename: the next field is the old path
+            i += 1
+        i += 1
+    return dirty
 
 
 def is_binary(path: Path) -> bool:
@@ -638,9 +700,14 @@ def build_repo(root: Path, include=None, exclude=None, cache=None,
     cache = cache or {}
     seen: "set[str]" = set()
 
-    # Phase A — select, read+hash, reuse from cache. Defer analysis of changed
-    # files so ctags can run over them in a single batch (Phase B).
-    pending: "list[tuple]" = []  # (path, rel, ext, data, digest)
+    # git fast path: a tracked, clean file whose blob sha matches its cached
+    # node is unchanged — reuse it without reading/hashing the file at all.
+    blob = git_blob_shas(root)                 # None when not a git repo
+    dirty = git_dirty_files(root) if blob is not None else set()
+
+    # Phase A — select, detect changes, reuse from cache. Defer analysis of
+    # changed files so ctags can run over them in a single batch (Phase B).
+    pending: "list[tuple]" = []  # (path, rel, ext, data, digest, gitsha)
     reused: "dict[str, FileNode]" = {}
     order: "list[str]" = []      # rel paths in walk order, for stable assembly
     for path in sorted(list_files(root)):
@@ -649,31 +716,45 @@ def build_repo(root: Path, include=None, exclude=None, cache=None,
         rel = path.relative_to(root).as_posix()
         if not path_selected(rel, include, exclude):
             continue
+        cached = cache.get(rel)
+        cur_gitsha = blob.get(rel) if blob is not None else None
+
+        if (cur_gitsha and rel not in dirty and cached is not None
+                and cached.gitsha == cur_gitsha):
+            seen.add(rel)
+            order.append(rel)
+            reused[rel] = cached
+            continue  # unchanged per git — no file read
+
         read = read_file_bytes(path)
         if read is None:
             continue
         data, digest = read
         seen.add(rel)
         order.append(rel)
-        cached = cache.get(rel)
         if cached is not None and cached.content_hash == digest:
+            if cur_gitsha:
+                cached.gitsha = cur_gitsha  # learn blob sha for next-run fast path
             reused[rel] = cached
         else:
-            pending.append((path, rel, path.suffix.lower(), data, digest))
+            pending.append((path, rel, path.suffix.lower(), data, digest,
+                            cur_gitsha or ""))
 
     # Phase B — one batch ctags call over the changed files with a known language.
     ctags_syms: "dict[str, list[Symbol]]" = {}
     if use_ctags and symbols_level != "none" and ctags_available():
         abs_for_ctags = [
-            str(p) for (p, _rel, ext, _d, _h) in pending if EXT_TO_LANG.get(ext)
+            str(p) for (p, _rel, ext, _d, _h, _g) in pending if EXT_TO_LANG.get(ext)
         ]
         ctags_syms = run_ctags(abs_for_ctags, symbols_level)
 
     analyzed: "dict[str, FileNode]" = {}
-    for path, rel, ext, data, digest in pending:
+    for path, rel, ext, data, digest, gitsha in pending:
         # A None lookup → ctags absent or blind for this file → regex fallback.
         cs = ctags_syms.get(str(path))
-        analyzed[rel] = analyze_bytes(rel, ext, data, digest, cs, symbols_level)
+        node = analyze_bytes(rel, ext, data, digest, cs, symbols_level)
+        node.gitsha = gitsha
+        analyzed[rel] = node
 
     for rel in order:
         if rel in reused:
@@ -694,22 +775,25 @@ def build_repo(root: Path, include=None, exclude=None, cache=None,
 
 
 def repo_to_dict(repo: Repo) -> dict:
+    def file_dict(f):
+        d = {
+            "path": f.rel_path,
+            "language": f.language,
+            "lines": f.line_count,
+            "hash": f.content_hash,
+            "doc": f.doc,
+            "symbols": [
+                {"name": s.name, "kind": s.kind, "line": s.line} for s in f.symbols
+            ],
+            "imports": f.imports,
+        }
+        if f.gitsha:  # omit when absent (non-git) to keep the artifact lean
+            d["gitsha"] = f.gitsha
+        return d
+
     return {
         "repo": {"name": repo.name, "readme_summary": repo.readme_summary},
-        "files": [
-            {
-                "path": f.rel_path,
-                "language": f.language,
-                "lines": f.line_count,
-                "hash": f.content_hash,
-                "doc": f.doc,
-                "symbols": [
-                    {"name": s.name, "kind": s.kind, "line": s.line} for s in f.symbols
-                ],
-                "imports": f.imports,
-            }
-            for f in repo.files
-        ],
+        "files": [file_dict(f) for f in repo.files],
     }
 
 
@@ -722,6 +806,7 @@ def files_from_dict(d: dict) -> "dict[str, FileNode]":
             language=fd.get("language", ""),
             line_count=fd.get("lines", 0),
             content_hash=fd.get("hash", ""),
+            gitsha=fd.get("gitsha", ""),
             doc=fd.get("doc", ""),
             symbols=[Symbol(**s) for s in fd.get("symbols", [])],
             imports=list(fd.get("imports", [])),
@@ -904,6 +989,145 @@ def render_index(repo: Repo) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Querying — lookups over a built Repo. Used by the CLI query flags and the MCP
+# server. All structural (no embeddings) — exact/lexical, honest about limits.
+# --------------------------------------------------------------------------- #
+
+_TOKEN_SPLIT = re.compile(r"[^A-Za-z0-9]+")
+_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def tokenize(name: str) -> "list[str]":
+    """Split an identifier into lowercased word tokens.
+
+    Handles camelCase, snake_case, kebab-case and dotted names, so e.g.
+    `retryRequest`, `with_retries`, `Owner.retry` all yield a `retry` token —
+    which is what lets `search` match a query by intent words, not exact name.
+    """
+    words: "list[str]" = []
+    for part in _TOKEN_SPLIT.split(name):
+        if part:
+            words.extend(_CAMEL.sub(" ", part).split())
+    return [w.lower() for w in words if w]
+
+
+def _iter_symbols(repo: Repo):
+    for f in repo.files:
+        for s in f.symbols:
+            yield f, s
+
+
+def find_symbol(repo: Repo, query: str, kind=None, limit: int = 50):
+    """Locate symbols by name (substring, case-insensitive), exact matches first.
+
+    Returns a list of (rel_path, line, kind, name).
+    """
+    q = query.lower()
+    rows = []
+    for f, s in _iter_symbols(repo):
+        if kind and s.kind != kind:
+            continue
+        if q in s.name.lower():
+            rows.append((s.name.lower() != q, f.rel_path, s.line, s.kind, s.name))
+    rows.sort()
+    return [(r[1], r[2], r[3], r[4]) for r in rows[:limit]]
+
+
+def search_symbols(repo: Repo, query: str, limit: int = 30):
+    """Rank symbols by word-token overlap of the query with the symbol name and
+    its file's leading doc — a lexical bridge toward "by intent" search (no
+    embeddings). Returns (rel_path, line, kind, name, score), best first.
+    """
+    terms = set(tokenize(query))
+    if not terms:
+        return []
+    ql = query.lower()
+    scored = []
+    for f, s in _iter_symbols(repo):
+        name_hits = len(terms & set(tokenize(s.name)))
+        doc_hits = len(terms & set(tokenize(f.doc))) if f.doc else 0
+        score = name_hits * 3 + doc_hits
+        if s.name.lower() == ql:
+            score += 5
+        elif not score and ql in s.name.lower():
+            score = 1  # substring fallback (e.g. 'conn' → 'reconnect')
+        if score > 0:
+            scored.append((score, f.rel_path, s.line, s.kind, s.name))
+    scored.sort(key=lambda r: (-r[0], r[1], r[2]))
+    return [(r[1], r[2], r[3], r[4], r[0]) for r in scored[:limit]]
+
+
+def find_refs(root, name: str, limit: int = 80, definitions=None):
+    """Lexical usages of an identifier (word-boundary): git grep when available,
+    else a stdlib scan over walked files.
+
+    Approximate by design — this is "where does the name `X` appear", NOT a
+    resolved call graph: it can't tell `a.connect()` from `b.connect()` and may
+    include comments/strings. `definitions` is an optional set of (rel, line) to
+    flag known definition sites. Returns (rel_path, line, is_def, text).
+    """
+    root = Path(root).resolve()
+    definitions = definitions or set()
+    rows = []
+    used_git = False
+    if (root / ".git").exists():
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(root), "grep", "-n", "-w", "--no-color", "-e", name],
+                capture_output=True, text=True,
+            )
+            if out.returncode in (0, 1):  # 1 = no matches, still success
+                used_git = True
+                for line in out.stdout.splitlines():
+                    p, _, rest = line.partition(":")
+                    ln, _, text = rest.partition(":")
+                    if ln.isdigit():
+                        rows.append((p, int(ln), text.strip()))
+        except OSError:
+            pass
+    if not used_git:
+        pat = re.compile(r"\b" + re.escape(name) + r"\b")
+        for path in list_files(root):
+            try:
+                rel = path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            read = read_file_bytes(path)
+            if read is None:
+                continue
+            for i, line in enumerate(read[0].decode("utf-8", "replace").splitlines(), 1):
+                if pat.search(line):
+                    rows.append((rel, i, line.strip()))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return [(rel, ln, (rel, ln) in definitions, text) for rel, ln, text in rows[:limit]]
+
+
+def def_locations(repo: Repo) -> "set[tuple]":
+    """{(rel_path, line)} of every known symbol definition — to flag defs in refs."""
+    return {(f.rel_path, s.line) for f, s in _iter_symbols(repo)}
+
+
+def format_symbol_rows(rows) -> str:
+    if not rows:
+        return "(no matches)"
+    return "\n".join(f"{r[0]}:{r[1]}  {r[2]}  {r[3]}" for r in rows)
+
+
+def format_search_rows(rows) -> str:
+    if not rows:
+        return "(no matches)"
+    return "\n".join(f"{r[0]}:{r[1]}  {r[2]}  {r[3]}  (score {r[4]})" for r in rows)
+
+
+def format_ref_rows(rows) -> str:
+    if not rows:
+        return "(no references)"
+    return "\n".join(
+        f"{r[0]}:{r[1]}  {'[def] ' if r[2] else ''}{r[3]}" for r in rows
+    )
+
+
+# --------------------------------------------------------------------------- #
 # CLI.
 # --------------------------------------------------------------------------- #
 
@@ -959,6 +1183,13 @@ def main(argv=None) -> int:
         "--ctags-path", metavar="BIN", default=None,
         help="path to the universal-ctags binary (default: 'ctags' on PATH)",
     )
+    q = parser.add_argument_group("query modes (print lookups instead of a map)")
+    q.add_argument("--find", metavar="NAME",
+                   help="print where symbols matching NAME are defined (path:line)")
+    q.add_argument("--search", metavar="QUERY",
+                   help="rank symbols by word/doc overlap with QUERY (lexical)")
+    q.add_argument("--refs", metavar="NAME",
+                   help="print lexical usages of NAME (git grep; approximate)")
     args = parser.parse_args(argv)
 
     if not args.repo.is_dir():
@@ -981,6 +1212,18 @@ def main(argv=None) -> int:
     # Persist/refresh the cache as JSON (same schema as --format json).
     if args.cache:
         args.cache.write_text(render_json(repo), encoding="utf-8")
+
+    # Query modes short-circuit: print the lookup, not a map.
+    if args.find is not None:
+        print(format_symbol_rows(find_symbol(repo, args.find)))
+        return 0
+    if args.search is not None:
+        print(format_search_rows(search_symbols(repo, args.search)))
+        return 0
+    if args.refs is not None:
+        print(format_ref_rows(find_refs(repo.root, args.refs,
+                                        definitions=def_locations(repo))))
+        return 0
 
     rendered = RENDERERS[args.format](repo)
 

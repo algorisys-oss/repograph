@@ -6,6 +6,8 @@ or:
     python repograph/tests/test_repograph.py
 """
 
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -413,6 +415,114 @@ class CtagsTest(unittest.TestCase):
         files = rg.files_from_dict(rg.repo_to_dict(repo))
         self.assertEqual(files["a.py"].symbols[0].name, "C.m")
         self.assertEqual(files["a.py"].symbols[0].kind, "method")
+
+
+class QueryTest(unittest.TestCase):
+    """find_symbol / search_symbols / find_refs / tokenize."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        write_fixture(self.root)
+        self.repo = rg.build_repo(self.root, use_ctags=False)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_tokenize(self):
+        self.assertEqual(rg.tokenize("retryRequest"), ["retry", "request"])
+        self.assertEqual(rg.tokenize("with_retries"), ["with", "retries"])
+        self.assertEqual(rg.tokenize("HTTPServer"), ["http", "server"])
+        self.assertEqual(rg.tokenize("Owner.doThing"), ["owner", "do", "thing"])
+
+    def test_find_symbol(self):
+        rows = rg.find_symbol(self.repo, "main")
+        self.assertIn(("src/app.py", 6, "function", "main"), rows)
+        # substring + exact ordering: exact 'Widget' matches come first
+        names = [r[3] for r in rg.find_symbol(self.repo, "Widget")]
+        self.assertIn("Widget", names)
+
+    def test_find_symbol_kind_filter(self):
+        rows = rg.find_symbol(self.repo, "Server", kind="class")
+        self.assertTrue(all(r[2] == "class" for r in rows))
+        self.assertTrue(any(r[3] == "Server" for r in rows))
+
+    def test_search_matches_name_tokens(self):
+        rows = rg.search_symbols(self.repo, "server")
+        self.assertTrue(rows and rows[0][3] == "Server")
+
+    def test_search_matches_doc_tokens(self):
+        # src/app.py docstring is "App entry point." — a doc-word query should
+        # surface symbols from that file even though names don't contain them.
+        hits = {(r[0], r[3]) for r in rg.search_symbols(self.repo, "entry point")}
+        self.assertIn(("src/app.py", "main"), hits)
+
+    def test_find_refs_stdlib_scan(self):
+        # Non-git temp dir → stdlib scan path. 'helper' is imported and called.
+        defs = rg.def_locations(self.repo)
+        rows = rg.find_refs(self.root, "helper", definitions=defs)
+        hits = {(r[0], r[1]) for r in rows}
+        self.assertIn(("src/app.py", 3), hits)   # `from utils import helper`
+        self.assertIn(("src/app.py", 7), hits)   # `return helper()`
+
+    def test_format_helpers(self):
+        self.assertEqual(rg.format_symbol_rows([]), "(no matches)")
+        self.assertEqual(
+            rg.format_ref_rows([("a.py", 3, True, "def x():")]),
+            "a.py:3  [def] def x():",
+        )
+
+
+@unittest.skipIf(shutil.which("git") is None, "git not available")
+class GitFastPathTest(unittest.TestCase):
+    """The git-blob-sha fast path reuses unchanged tracked files without reading."""
+
+    def _git(self, *args):
+        subprocess.run(["git", *args], cwd=self.root, check=True,
+                       capture_output=True)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "x.py").write_text("def a():\n    pass\n")
+        (self.root / "y.py").write_text("def b():\n    pass\n")
+        self._git("init", "-q")
+        self._git("config", "user.email", "t@t")
+        self._git("config", "user.name", "t")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "init")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _cache_of(self, repo):
+        return {f.rel_path: f for f in repo.files}
+
+    def test_warm_reuse_and_gitsha_stored(self):
+        first = rg.build_repo(self.root, use_ctags=False)
+        # gitsha learned for every tracked file on the cold pass
+        self.assertTrue(all(f.gitsha for f in first.files))
+        again = rg.build_repo(self.root, cache=self._cache_of(first), use_ctags=False)
+        self.assertEqual(again.analyzed, 0)
+        self.assertEqual(again.reused, 2)
+
+    def test_committed_change_reanalyzes_only_that_file(self):
+        first = rg.build_repo(self.root, use_ctags=False)
+        (self.root / "y.py").write_text("def b():\n    pass\ndef c():\n    pass\n")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "upd")
+        again = rg.build_repo(self.root, cache=self._cache_of(first), use_ctags=False)
+        self.assertEqual(again.analyzed, 1)
+        self.assertEqual(again.reused, 1)
+
+    def test_unstaged_edit_is_reanalyzed(self):
+        first = rg.build_repo(self.root, use_ctags=False)
+        # modify without committing → blob sha unchanged, but working tree dirty
+        (self.root / "x.py").write_text("def a():\n    pass\ndef z():\n    pass\n")
+        again = rg.build_repo(self.root, cache=self._cache_of(first), use_ctags=False)
+        self.assertEqual(again.analyzed, 1)
+        by = {f.rel_path: f for f in again.files}
+        self.assertEqual({s.name for s in by["x.py"].symbols}, {"a", "z"})
 
 
 if __name__ == "__main__":

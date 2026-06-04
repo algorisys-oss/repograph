@@ -33,6 +33,11 @@ python repograph.py /path/to/repo -o REPOMAP.md --cache .repograph.json
 # Symbol detail vs. tokens (see "Symbol extraction"): none | defs (default) | full
 python repograph.py /path/to/repo -f index --symbols full     # incl. members/fields
 python repograph.py /path/to/repo -f index --no-ctags         # force regex backend
+
+# Query modes — print a lookup instead of a map (build via --cache for speed):
+python repograph.py . --find build_repo        # where is a symbol defined?
+python repograph.py . --search "parse message" # rank symbols by name/doc words
+python repograph.py . --refs run_ctags         # where is a name used? (approx.)
 ```
 
 Links in the Markdown output are relative to the repo root, so they resolve when
@@ -61,7 +66,9 @@ It exposes two tools:
 | Tool | What it does |
 |------|--------------|
 | `repo_index` | Build/refresh the index (cached, incremental) and return it for routing. Args: `path?`, `include?`, `exclude?`, `symbols?`, `no_ctags?`, `rebuild?` |
-| `find_symbol` | Find where a symbol is defined → `path:line  kind  name` rows (exact matches first; finds qualified `Owner.method`). Args: `query`, `path?`, `kind?`, `limit?` |
+| `find_symbol` | Find where a symbol is **defined** → `path:line  kind  name` rows (exact matches first; finds qualified `Owner.method`). Args: `query`, `path?`, `kind?`, `limit?` |
+| `search` | Lexical **by-intent** symbol search — ranks by word-token overlap of the query with symbol names *and* file doc comments (`retry request` → `retryRequest`). Not semantic. Args: `query`, `path?`, `limit?` |
+| `find_refs` | Find where an identifier is **used** → `path:line [def] text` (git grep; approximate, name-based). Args: `name`, `path?`, `limit?` |
 
 Register it by pointing any MCP client at `python3 .../repograph_mcp.py`:
 
@@ -109,8 +116,11 @@ deleted files are dropped. It prints `Updated: N changed, M reused, K removed`.
 Use `--rebuild` to ignore the cache and analyze everything.
 
 Change detection is by **content hash**, so it's robust to fresh clones and
-mtime quirks (the trade-off: every file is still read each run to hash it — the
-saved work is the parsing, not the I/O).
+mtime quirks. In a **git repo** there's a fast path: repograph compares each
+tracked file's git blob sha (from `git ls-files -s`, no file read) against the
+cache and only reads files git reports as changed or dirty — so warm re-runs on
+large repos skip the per-file hashing I/O too, while non-git repos fall back to
+hashing every file (always correct).
 
 ### Keeping the map fresh in your own project
 
