@@ -1,6 +1,7 @@
 {
   "name": "repograph",
   "version": "0.1.0",
+  "private": true,
   "description": "Language-agnostic repo map / knowledge graph for a local repo. Zero-dependency Python core, exposed as an npm CLI.",
   "license": "MIT",
   "author": "Rajesh Pillai",

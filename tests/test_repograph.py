@@ -539,6 +539,26 @@ class GitFastPathTest(unittest.TestCase):
         self.assertNotIn("ign.py", paths)            # gitignored → excluded
         self.assertNotIn(".repograph/map.index", paths)  # own artifact → excluded
 
+    def test_rename_marks_new_path_dirty(self):
+        # `git status --porcelain -z` emits a rename as "R  <new>\0<old>\0";
+        # git_dirty_files must take the NEW (working-tree) path, not the old.
+        self._git("mv", "x.py", "renamed.py")
+        dirty = rg.git_dirty_files(self.root)
+        self.assertIn("renamed.py", dirty)           # new path is what exists now
+        self.assertNotIn("x.py", dirty)              # old path is gone
+
+    def test_find_refs_uses_git_grep(self):
+        # In a git repo, find_refs goes through `git grep` (not the stdlib scan).
+        (self.root / "x.py").write_text("def a():\n    return a()\n")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "ref")
+        repo = rg.build_repo(self.root, use_ctags=False)
+        rows = rg.find_refs(self.root, "a", definitions=rg.def_locations(repo))
+        hits = {(r[0], r[1]) for r in rows}
+        self.assertIn(("x.py", 1), hits)             # def a()
+        self.assertIn(("x.py", 2), hits)             # return a()
+        self.assertTrue(any(r[2] for r in rows if r[0] == "x.py" and r[1] == 1))  # def flagged
+
 
 class ReviewFixTest(unittest.TestCase):
     """Regression tests for the reviewed findings (cache profile + artifacts)."""

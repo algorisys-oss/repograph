@@ -9,13 +9,19 @@ const { spawnSync } = require('child_process');
 const path = require('path');
 
 const script = path.join(__dirname, '..', 'repograph.py');
-const python = process.env.PYTHON || 'python3';
+// PYTHON env wins; otherwise try python3 then python (stock Windows ships the
+// latter, not the former).
+const candidates = process.env.PYTHON ? [process.env.PYTHON] : ['python3', 'python'];
 
-const res = spawnSync(python, [script, ...process.argv.slice(2)], { stdio: 'inherit' });
+let res;
+for (const python of candidates) {
+  res = spawnSync(python, [script, ...process.argv.slice(2)], { stdio: 'inherit' });
+  if (!(res.error && res.error.code === 'ENOENT')) break;  // launched (or non-ENOENT failure)
+}
 
 if (res.error) {
   if (res.error.code === 'ENOENT') {
-    console.error(`repograph: '${python}' not found on PATH. Install Python 3.8+ or set PYTHON=...`);
+    console.error(`repograph: no Python found (tried: ${candidates.join(', ')}). Install Python 3.8+ or set PYTHON=...`);
     process.exit(127);
   }
   console.error(`repograph: failed to launch: ${res.error.message}`);
