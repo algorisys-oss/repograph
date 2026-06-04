@@ -76,18 +76,20 @@ saved work is the parsing, not the I/O).
 
 The whole point is to be much smaller than the code while still routing an LLM to
 the right `file:line`. Measured on the ziglang/zig standard library + compiler
-(`lib/std` + `src`):
+(`lib/std` + `src`, 746 files, with the default ctags `--symbols=defs`):
 
 | Artifact | Size | ~Tokens | vs. reading the source |
 |----------|------|---------|------------------------|
-| Source in scope | 40.3 MB | ~10.5M | 1× |
-| `md` map (compact) | 1.6 MB | ~413k | **26× smaller** |
-| `json` graph | 1.4 MB | ~380k | **28× smaller** |
-| `index` (terse) | 0.4 MB | ~111k | **95× smaller** |
+| Source in scope | 42.2 MB | ~10.6M | 1× |
+| `md` map (compact) | 1.66 MB | ~415k | **26× smaller** |
+| `json` graph | 1.53 MB | ~381k | **28× smaller** |
+| `index` (terse) | 0.29 MB | ~73k | **145× smaller** |
 
-So instead of an agent reading ~10.5M tokens of source to find things, it reads
-a ~111k-token index, jumps to the exact `path:line`, and opens only the 2–3 files
-it needs. Slice further with `--include` to shrink any of these.
+So instead of an agent reading ~10.6M tokens of source to find things, it reads
+a ~73k-token index, jumps to the exact `path:line`, and opens only the 2–3 files
+it needs. Slice further with `--include` to shrink any of these. (The terse index
+is even smaller than the pre-ctags ~111k figure here: ctags groups and qualifies
+methods, which the grouped `Owner{m:line …}` rendering then packs tightly.)
 
 The ctags backend with the default `--symbols=defs` doesn't undo this — it can
 *improve* it. On the Python `PIL` package (~1.14 MB source, ~286k tokens), the
