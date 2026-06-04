@@ -11,6 +11,32 @@ yourself). Every file and symbol links back to the original source as
 - **Shallow & honest** — extraction is heuristic (regex, no real parsing). It
   will miss and mis-tag some things, especially imports. The output says so.
 
+## Install
+
+The tool is the single file `repograph.py` — there is nothing to build. Pick
+whichever fits your project:
+
+```bash
+# A) Run it directly (needs Python 3.8+ on PATH; nothing else):
+python repograph.py --help
+
+# B) Install as an npm CLI — handy when a JS/TS repo wants to depend on it.
+#    This adds a `repograph` command that forwards to the bundled Python script,
+#    so Python 3.8+ must still be on PATH. No npm-registry publish needed:
+npm install -D github:algorisys-oss/repograph            # latest on the default branch
+npm install -D github:algorisys-oss/repograph#v0.1.0     # pin to a tag (recommended)
+npm install -D github:algorisys-oss/repograph#<commit>   # pin to a commit SHA
+
+# Then run it via the linked bin (or `npx repograph`):
+npx repograph --help
+```
+
+When installed via npm, the `repograph` command is a thin Node shim
+(`bin/repograph.js`) that spawns `python3 repograph.py` with your args. Override
+the interpreter with the `PYTHON` env var (e.g. `PYTHON=python`). Everywhere the
+examples below show `python repograph.py`, you can substitute `repograph` /
+`npx repograph` once installed.
+
 ## Usage
 
 ```bash
