@@ -1,0 +1,24 @@
+{
+  "name": "repograph",
+  "version": "0.1.0",
+  "description": "Language-agnostic repo map / knowledge graph for a local repo. Zero-dependency Python core, exposed as an npm CLI.",
+  "license": "MIT",
+  "author": "Rajesh Pillai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/algorisys-oss/repograph.git"
+  },
+  "bin": {
+    "repograph": "bin/repograph.js"
+  },
+  "files": [
+    "bin/",
+    "repograph.py",
+    "repograph_mcp.py",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=14"
+  }
+}
