@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -1146,6 +1147,103 @@ def format_ref_rows(rows) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# init — scaffold the committed-map integration into a consuming repo.
+# --------------------------------------------------------------------------- #
+
+# A portable (POSIX sh) pre-commit hook. It resolves the repograph command at
+# *commit time* — preferring the consumer's installed npm bin — so it works in
+# any repo that depends on repograph regardless of where node_modules lives, and
+# no-ops cleanly when the tool isn't installed yet (e.g. a fresh clone before
+# `npm install`). It refreshes the committed map and stages it, so .repograph/
+# travels with each commit.
+HOOK_TEMPLATE = """\
+#!/bin/sh
+# >>> repograph >>>
+# Managed by `repograph init` — refreshes the committed repo map and stages it.
+# No-op if repograph isn't installed, so it never blocks a commit.
+set -e
+ROOT=$(git rev-parse --show-toplevel)
+if   [ -n "${{REPOGRAPH:-}}" ]; then RG="$REPOGRAPH"
+elif [ -x "$ROOT/node_modules/.bin/repograph" ]; then RG="$ROOT/node_modules/.bin/repograph"
+elif command -v repograph >/dev/null 2>&1; then RG=repograph
+else exit 0
+fi
+"$RG" "$ROOT" -f index -o "$ROOT/.repograph/index.txt" --cache "$ROOT/.repograph/graph.json"{scope} >/dev/null 2>&1 || exit 0
+"$RG" "$ROOT" -f md    -o "$ROOT/.repograph/map.md"    --cache "$ROOT/.repograph/graph.json"{scope} >/dev/null 2>&1 || exit 0
+git add "$ROOT/.repograph" 2>/dev/null || true
+# <<< repograph <<<
+"""
+
+
+def _scope_flags(include, exclude) -> str:
+    """Render include/exclude globs as shell-quoted CLI flags to bake into the
+    hook, so refreshes use the same scope as `init`. Leading space when non-empty."""
+    parts = []
+    for g in include or []:
+        parts.append("--include " + shlex.quote(g))
+    for g in exclude or []:
+        parts.append("--exclude " + shlex.quote(g))
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def cmd_init(repo: Path, include, exclude, symbols_level: str,
+             use_ctags: bool) -> int:
+    """Scaffold the committed-map workflow into `repo`:
+
+      1. build the initial .repograph/ map (index.txt + map.md + graph.json),
+      2. write a tracked .githooks/pre-commit that refreshes + stages it,
+      3. activate it locally (core.hooksPath), and print how to make it
+         auto-activate for everyone who clones.
+    """
+    repo = repo.resolve()
+    if not (repo / ".git").exists():
+        print(f"repograph init: {repo} is not a git repo", file=sys.stderr)
+        return 1
+
+    # 1. Initial map — reuse an existing cache if one is already there.
+    outdir = repo / ".repograph"
+    outdir.mkdir(exist_ok=True)
+    cache_path = outdir / "graph.json"
+    cache = load_cache(cache_path) if cache_path.exists() else {}
+    graph = build_repo(repo, include=include, exclude=exclude, cache=cache,
+                       use_ctags=use_ctags, symbols_level=symbols_level)
+    (outdir / "index.txt").write_text(render_index(graph), encoding="utf-8")
+    (outdir / "map.md").write_text(render_markdown(graph), encoding="utf-8")
+    cache_path.write_text(render_json(graph), encoding="utf-8")
+
+    # 2. Tracked pre-commit hook with the scope baked in.
+    hooks = repo / ".githooks"
+    hooks.mkdir(exist_ok=True)
+    hook = hooks / "pre-commit"
+    hook.write_text(HOOK_TEMPLATE.format(scope=_scope_flags(include, exclude)),
+                    encoding="utf-8")
+    hook.chmod(0o755)
+
+    # 3. Activate for the current clone.
+    activated = False
+    try:
+        subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath",
+                        ".githooks"], check=True, capture_output=True)
+        activated = True
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+    # 4. Report + how to make it auto-activate on every clone.
+    n = len(graph.files)
+    print(f"repograph init: wrote .repograph/ ({n} files) + .githooks/pre-commit",
+          file=sys.stderr)
+    print("  core.hooksPath -> .githooks " +
+          ("(set)" if activated else "(set it manually: git config core.hooksPath .githooks)"),
+          file=sys.stderr)
+    if (repo / "package.json").exists():
+        print('  to auto-activate after clone, add to package.json scripts:\n'
+              '    "prepare": "git config core.hooksPath .githooks"', file=sys.stderr)
+    print("  commit .repograph/ and .githooks/ so the map travels with the repo.",
+          file=sys.stderr)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # CLI.
 # --------------------------------------------------------------------------- #
 
@@ -1208,6 +1306,13 @@ def main(argv=None) -> int:
                    help="rank symbols by word/doc overlap with QUERY (lexical)")
     q.add_argument("--refs", metavar="NAME",
                    help="print lexical usages of NAME (git grep; approximate)")
+    parser.add_argument(
+        "--init", action="store_true",
+        help="scaffold the committed-map workflow into REPO: write .repograph/, "
+             "a tracked .githooks/pre-commit that refreshes+stages it, and "
+             "activate it. Respects --include/--exclude/--symbols (baked into "
+             "the hook).",
+    )
     args = parser.parse_args(argv)
 
     if not args.repo.is_dir():
@@ -1217,6 +1322,10 @@ def main(argv=None) -> int:
     global _CTAGS_BIN
     if args.ctags_path:
         _CTAGS_BIN = args.ctags_path
+
+    if args.init:
+        return cmd_init(args.repo, include=args.include, exclude=args.exclude,
+                        symbols_level=args.symbols, use_ctags=not args.no_ctags)
 
     cache = {}
     if args.cache and args.cache.exists() and not args.rebuild:

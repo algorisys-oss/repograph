@@ -32,10 +32,36 @@ npx repograph --help
 ```
 
 When installed via npm, the `repograph` command is a thin Node shim
-(`bin/repograph.js`) that spawns `python3 repograph.py` with your args. Override
-the interpreter with the `PYTHON` env var (e.g. `PYTHON=python`). Everywhere the
-examples below show `python repograph.py`, you can substitute `repograph` /
-`npx repograph` once installed.
+(`bin/repograph.js`) that spawns `python3 repograph.py` (falling back to
+`python`) with your args. Override the interpreter with the `PYTHON` env var
+(e.g. `PYTHON=python`). Everywhere the examples below show `python repograph.py`,
+you can substitute `repograph` / `npx repograph` once installed.
+
+### Keep the map fresh automatically (`repograph init`)
+
+For a repo that should carry a committed, always-current map, run once:
+
+```bash
+npx repograph init                              # whole repo
+npx repograph init --include 'src/*' --exclude '*test*'   # scoped (baked into the hook)
+```
+
+`init` writes `.repograph/{index.txt,map.md,graph.json}`, installs a tracked
+`.githooks/pre-commit` that refreshes the map and `git add`s it on every commit,
+and points `core.hooksPath` at `.githooks`. The map is then **committed with your
+code**, so a fresh clone has it immediately — reading the map needs no Python at
+all; only refreshing does. The hook resolves the tool through the consumer's own
+`node_modules/.bin/repograph`, so it works in any repo that depends on repograph,
+and no-ops cleanly when the tool isn't installed (e.g. before `npm install`).
+
+To make the hook auto-activate for everyone who clones, add to `package.json`:
+
+```json
+"scripts": { "prepare": "git config core.hooksPath .githooks" }
+```
+
+Commit `.repograph/` and `.githooks/`. (Without npm, `tools/install-git-hook.sh`
+does the same via the in-source tool.)
 
 ## Usage
 

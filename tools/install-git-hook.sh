@@ -1,48 +1,45 @@
 #!/usr/bin/env bash
 #
-# install-git-hook.sh — auto-refresh the repograph map on git activity.
+# install-git-hook.sh — set up the committed-map workflow for a repo.
 #
-# Installs (or appends to) post-commit, post-merge and post-checkout hooks that
-# call refresh-map.sh, so the index in <repo>/.repograph/ stays current with no
-# manual step. Existing hooks are preserved (our block is appended, not clobbered).
+# Thin wrapper over `repograph --init`: it builds <repo>/.repograph/, writes a
+# tracked .githooks/pre-commit that refreshes + stages the map on every commit,
+# and activates it (core.hooksPath). The map then travels with the repo, and a
+# fresh clone gets it immediately — refreshing only needs the tool, reading does
+# not. Re-running is safe (idempotent: it rewrites the same managed files).
 #
 # Usage:
-#   tools/install-git-hook.sh [REPO_DIR]
-#   REPOGRAPH_PY=/path/to/repograph.py tools/install-git-hook.sh ~/proj
+#   tools/install-git-hook.sh [REPO_DIR] [--include 'src/*' --exclude '*test*' ...]
+#   REPOGRAPH=/path/to/repograph tools/install-git-hook.sh ~/proj
 #
-# Re-running is safe (idempotent). To uninstall, delete the marked block from the
-# hook files in <repo>/.git/hooks/.
+# Scope flags after REPO_DIR are forwarded to --init and baked into the hook.
+#
+# Finding the repograph tool (priority): $REPOGRAPH (executable) → $REPOGRAPH_PY
+# (via $PYTHON) → <repo>/node_modules/.bin/repograph → ../repograph.py → PATH.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REFRESH="$SCRIPT_DIR/refresh-map.sh"
-REPO="${1:-$(pwd)}"
-RP="${REPOGRAPH_PY:-}"   # bake an explicit tool path into the hook if provided
+PY="${PYTHON:-python3}"
 
-GITDIR="$REPO/.git"
-[ -e "$GITDIR" ] || { echo "not a git repo: $REPO" >&2; exit 1; }
-# Support worktrees / submodules where .git is a file pointing elsewhere.
-if [ -f "$GITDIR" ]; then
-  GITDIR="$REPO/$(sed -n 's/^gitdir: //p' "$GITDIR")"
+# Optional first arg = repo dir (must be an existing dir, not a flag).
+REPO="$(pwd)"
+if [ "${1:-}" ] && [ "${1#-}" = "${1:-}" ] && [ -d "${1:-}" ]; then
+  REPO="$1"; shift
 fi
-HOOK_DIR="$GITDIR/hooks"
-mkdir -p "$HOOK_DIR"
 
-MARKER="# >>> repograph refresh-map hook >>>"
-for h in post-commit post-merge post-checkout; do
-  HOOK="$HOOK_DIR/$h"
-  if [ -f "$HOOK" ] && grep -qF "$MARKER" "$HOOK"; then
-    echo "$h: already installed — skipping"
-    continue
-  fi
-  [ -f "$HOOK" ] || printf '#!/bin/sh\n' > "$HOOK"
-  {
-    echo "$MARKER"
-    echo "REPOGRAPH_PY=\"$RP\" \"$REFRESH\" \"$REPO\" >/dev/null 2>&1 || true"
-    echo "# <<< repograph refresh-map hook <<<"
-  } >> "$HOOK"
-  chmod +x "$HOOK"
-  echo "$h: installed"
-done
+if [ -n "${REPOGRAPH:-}" ]; then
+  RG=("$REPOGRAPH")
+elif [ -n "${REPOGRAPH_PY:-}" ]; then
+  RG=("$PY" "$REPOGRAPH_PY")
+elif [ -x "$REPO/node_modules/.bin/repograph" ]; then
+  RG=("$REPO/node_modules/.bin/repograph")
+elif [ -f "$SCRIPT_DIR/../repograph.py" ]; then
+  RG=("$PY" "$SCRIPT_DIR/../repograph.py")
+elif command -v repograph >/dev/null 2>&1; then
+  RG=(repograph)
+else
+  echo "install-git-hook: cannot find repograph — set REPOGRAPH=/path/to/bin or REPOGRAPH_PY=/path/to/repograph.py" >&2
+  exit 1
+fi
 
-echo "Done. The map at $REPO/.repograph/ will refresh on commit / merge / checkout."
+exec "${RG[@]}" "$REPO" --init "$@"

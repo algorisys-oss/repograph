@@ -6,6 +6,7 @@ or:
     python repograph/tests/test_repograph.py
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -618,6 +619,70 @@ class ReviewFixTest(unittest.TestCase):
         paths = {f.rel_path for f in rg.build_repo(self.root, use_ctags=False).files}
         self.assertIn("a.py", paths)
         self.assertFalse(any(p.startswith(".repograph/") for p in paths))
+
+
+@unittest.skipIf(shutil.which("git") is None, "git not available")
+class InitTest(unittest.TestCase):
+    """`repograph --init` scaffolds the committed-map workflow into a repo."""
+
+    def _git(self, *args):
+        subprocess.run(["git", *args], cwd=self.root, check=True,
+                       capture_output=True)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "src").mkdir()
+        (self.root / "src" / "app.py").write_text("def main():\n    pass\n")
+        (self.root / "tests").mkdir()
+        (self.root / "tests" / "t.py").write_text("def test_x():\n    pass\n")
+        self._git("init", "-q")
+        self._git("config", "user.email", "t@t")
+        self._git("config", "user.name", "t")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_init_writes_map_hook_and_activates(self):
+        rc = rg.cmd_init(self.root, include=None, exclude=None,
+                         symbols_level="defs", use_ctags=False)
+        self.assertEqual(rc, 0)
+        # canonical artifacts (not the old map.index/map.graph.json names)
+        for name in ("index.txt", "map.md", "graph.json"):
+            self.assertTrue((self.root / ".repograph" / name).is_file(), name)
+        hook = self.root / ".githooks" / "pre-commit"
+        self.assertTrue(hook.is_file())
+        self.assertTrue(os.access(hook, os.X_OK))           # executable
+        body = hook.read_text()
+        self.assertIn("node_modules/.bin/repograph", body)  # resolves npm bin
+        self.assertIn("index.txt", body)
+        self.assertIn("git add", body)                      # stages the map
+        # activated for this clone
+        out = subprocess.run(["git", "-C", str(self.root), "config",
+                              "core.hooksPath"], capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(), ".githooks")
+
+    def test_init_bakes_scope_flags_into_hook(self):
+        rg.cmd_init(self.root, include=["src/*"], exclude=["*test*"],
+                    symbols_level="defs", use_ctags=False)
+        body = (self.root / ".githooks" / "pre-commit").read_text()
+        self.assertIn("--include 'src/*'", body)
+        self.assertIn("--exclude '*test*'", body)
+        # scope is honored in the generated index too
+        index = (self.root / ".repograph" / "index.txt").read_text()
+        self.assertIn("src/app.py", index)
+        self.assertNotIn("tests/t.py", index)
+
+    def test_init_non_git_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc = rg.cmd_init(Path(d), include=None, exclude=None,
+                             symbols_level="defs", use_ctags=False)
+            self.assertEqual(rc, 1)
+
+    def test_scope_flags_helper(self):
+        self.assertEqual(rg._scope_flags(None, None), "")
+        self.assertEqual(rg._scope_flags(["a/*"], ["b"]),
+                         " --include 'a/*' --exclude b")
 
 
 if __name__ == "__main__":
