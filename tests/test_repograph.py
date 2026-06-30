@@ -1039,6 +1039,102 @@ class ImportResolutionTest(unittest.TestCase):
         self.assertIn(("helper", "pkg.util"), files["app.py"].import_bindings)
 
 
+class GoJavaResolutionTest(unittest.TestCase):
+    """Phase 3: Go package-qualified + Java imported-class call resolution."""
+
+    GO_FILES = {
+        "util/util.go": "package util\nfunc Helper() int { return 1 }\n",
+        "cmd/main.go": ('package main\nimport "github.com/me/proj/util"\n'
+                        "func run() int { return util.Helper() }\n"),
+        # decoy Helper elsewhere -> name fallback would be ambiguous
+        "decoy.go": "package decoy\nfunc Helper() int { return 99 }\n",
+    }
+    JAVA_FILES = {
+        "com/lib/Util.java": ("package com.lib;\npublic class Util {\n"
+                              "    public static int helper() { return 1; }\n}\n"),
+        "com/app/Main.java": ("package com.app;\nimport com.lib.Util;\n"
+                              "public class Main {\n"
+                              "    int run() { return Util.helper(); }\n}\n"),
+    }
+
+    def _build(self, files, **kw):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        for rel, content in files.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        return rg.build_repo(root, use_ctags=False, edges=True, **kw)
+
+    def tearDown(self):
+        if hasattr(self, "_tmp"):
+            self._tmp.cleanup()
+
+    def test_go_import_binding(self):
+        repo = self._build(self.GO_FILES)
+        main = next(f for f in repo.files if f.rel_path == "cmd/main.go")
+        self.assertIn(("util", "github.com/me/proj/util"), main.import_bindings)
+
+    def test_go_grouped_import_binding(self):
+        bindings = rg.extract_import_bindings(
+            ['import (', '    "a/b/foo"', '    bar "c/d/baz"', ')'], "go")
+        self.assertIn(("foo", "a/b/foo"), bindings)
+        self.assertIn(("bar", "c/d/baz"), bindings)
+
+    def test_go_package_call_resolves(self):
+        # util.Helper() resolves to util/util.go, NOT the decoy
+        repo = self._build(self.GO_FILES)
+        hit = [r for r in rg.resolve_edges(repo)
+               if r.src == "run" and r.dst == "Helper"][0]
+        self.assertEqual((hit.dst_file, hit.conf, hit.prov),
+                         ("util/util.go", "high", "import"))
+
+    def test_go_package_resolver(self):
+        dir_files = {"util": ["util/util.go"], "proj/util": ["proj/util/x.go"]}
+        self.assertEqual(
+            rg._resolve_go_package("github.com/me/proj/util", dir_files),
+            ["proj/util/x.go"])  # longest-suffix wins over bare "util"
+        self.assertEqual(rg._resolve_go_package("net/http", dir_files), [])
+
+    def test_java_import_binding(self):
+        bindings = rg.extract_import_bindings(
+            ["import com.lib.Util;", "import static com.lib.C.make;",
+             "import com.lib.*;"], "java")
+        self.assertIn(("Util", "com.lib.Util"), bindings)
+        self.assertIn(("make", "com.lib.C"), bindings)        # static -> class
+        self.assertTrue(all(b[0] != "*" for b in bindings))   # wildcard skipped
+
+    def test_java_class_resolver(self):
+        fs = {"src/main/java/com/lib/Util.java", "com/app/Main.java"}
+        self.assertEqual(rg._resolve_java_class("com.lib.Util", fs),
+                         ["src/main/java/com/lib/Util.java"])  # source-root suffix
+        self.assertEqual(rg._resolve_java_class("java.util.List", fs), [])
+
+    def test_python_import_as_binding(self):
+        b = rg.extract_import_bindings(
+            ["import numpy as np", "import os"], "python")
+        self.assertIn(("np", "numpy"), b)
+        self.assertIn(("os", "os"), b)
+
+
+@unittest.skipUnless(rg.tree_sitter_available(),
+                     "tree-sitter grammar pack not installed")
+class JavaResolutionTreeSitterTest(unittest.TestCase):
+    """Java method calls need a method-aware backend (regex misses them)."""
+
+    def test_java_static_call_resolves(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        for rel, content in GoJavaResolutionTest.JAVA_FILES.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        repo = rg.build_repo(root, use_tree_sitter=True, edges=True)
+        hit = [r for r in rg.resolve_edges(repo) if r.dst == "helper"][0]
+        self.assertEqual((hit.dst_file, hit.conf), ("com/lib/Util.java", "high"))
+        self._tmp.cleanup()
+
+
 class WatchSignatureTest(unittest.TestCase):
     """_repo_signature underpins --watch change detection."""
 
