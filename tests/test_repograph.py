@@ -610,7 +610,8 @@ class ReviewFixTest(unittest.TestCase):
     def test_build_key_round_trips_through_cache_json(self):
         repo = rg.build_repo(self.root, use_ctags=False)
         files = rg.files_from_dict(rg.repo_to_dict(repo))
-        self.assertEqual(files["a.py"].build_key, "defs:0")
+        # build_key encodes "<level>:<backend>:<edges?>" — regex backend, no edges.
+        self.assertEqual(files["a.py"].build_key, "defs:rx:0")
 
     def test_repograph_artifacts_not_indexed_non_git(self):
         (self.root / ".repograph").mkdir()
@@ -683,6 +684,193 @@ class InitTest(unittest.TestCase):
         self.assertEqual(rg._scope_flags(None, None), "")
         self.assertEqual(rg._scope_flags(["a/*"], ["b"]),
                          " --include 'a/*' --exclude b")
+
+
+# A fixture with a clear call graph + inheritance, for the edge/query tests.
+EDGE_FIXTURE = {
+    "core.py": (
+        '"""Core module."""\n'
+        "def helper():\n"
+        "    return 1\n"
+        "\n"
+        "def main():\n"
+        "    return helper()\n"
+        "\n"
+        "class Base:\n"
+        "    def run(self):\n"
+        "        return helper()\n"
+        "\n"
+        "class Widget(Base):\n"
+        "    def render(self):\n"
+        "        return self.run()\n"
+    ),
+    "tests/test_core.py": (
+        "from core import main\n"
+        "def test_main():\n"
+        "    assert main() == 1\n"
+    ),
+}
+
+
+class EdgeExtractionTest(unittest.TestCase):
+    """Regex relationship-edge extraction: spans, calls, extends/implements."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        for rel, content in EDGE_FIXTURE.items():
+            p = self.root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        self.repo = rg.build_repo(self.root, use_ctags=False, edges=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _file(self, rel):
+        return next(f for f in self.repo.files if f.rel_path == rel)
+
+    def test_spans_assigned(self):
+        syms = {s.name: s for s in self._file("core.py").symbols}
+        self.assertEqual(syms["helper"].line, 2)
+        self.assertGreaterEqual(syms["helper"].end, 3)
+        self.assertGreater(syms["main"].end, syms["main"].line)
+
+    def test_extends_edge(self):
+        edges = self._file("core.py").edges
+        self.assertTrue(any(e.kind == "extends" and e.src == "Widget"
+                            and e.dst == "Base" for e in edges))
+
+    def test_call_edges_attributed_to_enclosing(self):
+        edges = self._file("core.py").edges
+        calls = {(e.src, e.dst) for e in edges if e.kind == "calls"}
+        self.assertIn(("main", "helper"), calls)
+        # `helper(` in a comment/keyword must not be attributed to file scope here
+
+    def test_edges_absent_without_flag(self):
+        repo = rg.build_repo(self.root, use_ctags=False)  # edges=False default
+        self.assertTrue(all(not f.edges for f in repo.files))
+
+    def test_build_key_includes_edges(self):
+        files = rg.files_from_dict(rg.repo_to_dict(self.repo))
+        self.assertEqual(files["core.py"].build_key, "defs:rx:1")
+
+    def test_edges_round_trip_json(self):
+        files = rg.files_from_dict(rg.repo_to_dict(self.repo))
+        calls = {(e.src, e.dst) for e in files["core.py"].edges if e.kind == "calls"}
+        self.assertIn(("main", "helper"), calls)
+
+
+class RelationshipQueryTest(unittest.TestCase):
+    """callers / callees / impact / affected over the edge graph."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        for rel, content in EDGE_FIXTURE.items():
+            p = self.root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        self.repo = rg.build_repo(self.root, use_ctags=False, edges=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_callers_of_helper(self):
+        callers = {r[2] for r in rg.find_callers(self.repo, "helper")}
+        self.assertIn("main", callers)
+        self.assertIn("run", callers)
+
+    def test_callees_of_main(self):
+        callees = {r[0] for r in rg.find_callees(self.repo, "main")}
+        self.assertIn("helper", callees)
+
+    def test_callees_resolve_to_def(self):
+        rows = rg.find_callees(self.repo, "main")
+        helper_rows = [r for r in rows if r[0] == "helper"]
+        self.assertTrue(helper_rows and helper_rows[0][1] == "core.py")
+
+    def test_impact_reaches_transitive_callers(self):
+        rows, files, tests = rg.find_impact(self.repo, "helper")
+        callers = {r[1] for r in rows}
+        self.assertIn("main", callers)
+
+    def test_affected_flags_test_file(self):
+        tests, others = rg.find_affected(self.repo, ["core.py"])
+        self.assertIn("tests/test_core.py", tests)
+
+    def test_is_test_path(self):
+        self.assertTrue(rg.is_test_path("tests/test_core.py"))
+        self.assertTrue(rg.is_test_path("foo.spec.js"))
+        self.assertFalse(rg.is_test_path("core.py"))
+
+    def test_query_formatters_empty(self):
+        self.assertIn("no callers", rg.format_caller_rows([]))
+        self.assertIn("no callees", rg.format_callee_rows([]))
+
+
+@unittest.skipUnless(rg.tree_sitter_available(),
+                     "tree-sitter grammar pack not installed")
+class TreeSitterBackendTest(unittest.TestCase):
+    """The optional tree-sitter backend: precise symbols + call edges."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "core.py").write_text(EDGE_FIXTURE["core.py"], encoding="utf-8")
+        self.repo = rg.build_repo(self.root, use_ctags=False,
+                                  use_tree_sitter=True, edges=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_methods_qualified(self):
+        names = {s.name for f in self.repo.files for s in f.symbols}
+        self.assertIn("Widget.render", names)
+        self.assertIn("Base.run", names)
+
+    def test_precise_call_edges(self):
+        edges = self.repo.files[0].edges
+        calls = {(e.src, e.dst) for e in edges if e.kind == "calls"}
+        # render calls self.run() -> attributed to the exact method, callee 'run'
+        self.assertIn(("Widget.render", "run"), calls)
+        self.assertIn(("main", "helper"), calls)
+
+    def test_backend_tag_in_build_key(self):
+        self.assertTrue(self.repo.files[0].build_key.startswith("defs:ts:"))
+
+    def test_direct_ts_extract(self):
+        data = EDGE_FIXTURE["core.py"].encode("utf-8")
+        res = rg.ts_extract(data, "python", ".py", "defs")
+        self.assertIsNotNone(res)
+        syms, edges = res
+        # exact end lines from the AST
+        helper = next(s for s in syms if s.name == "helper")
+        self.assertEqual(helper.line, 2)
+        self.assertEqual(helper.end, 3)
+
+
+class WatchSignatureTest(unittest.TestCase):
+    """_repo_signature underpins --watch change detection."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        write_fixture(self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_signature_changes_on_edit(self):
+        sig1 = rg._repo_signature(self.root)
+        self.assertTrue(sig1)
+        # rewrite a file with a newer mtime
+        target = self.root / "src" / "app.py"
+        st = target.stat()
+        target.write_text("# changed\n", encoding="utf-8")
+        os.utime(target, (st.st_atime + 5, st.st_mtime + 5))
+        sig2 = rg._repo_signature(self.root)
+        self.assertNotEqual(sig1, sig2)
 
 
 if __name__ == "__main__":

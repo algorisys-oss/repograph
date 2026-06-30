@@ -6,14 +6,21 @@ directory tree, and a per-file breakdown of symbols (functions/types/classes),
 leading docs, and imports. Every file and symbol links back to the original
 source as `path#Lnn`, so the map doubles as an index into the code.
 
-Extraction is deliberately *shallow and heuristic* — regex per language, no real
+Extraction is *shallow and heuristic by default* — regex per language, no real
 parsing — which is what makes it work on any repo with zero dependencies. It will
-miss and mis-tag some things, especially imports; sections say so.
+miss and mis-tag some things, especially imports; sections say so. Two optional
+backends raise precision when present: universal-ctags (auto-detected) and
+tree-sitter (opt-in via --tree-sitter), the latter also yielding an accurate call
+graph.
+
+With --edges (or any of the --callers/--callees/--impact/--affected queries) it
+also extracts relationship edges (calls / extends / implements) and can answer
+call-graph questions — approximate on the regex backend, precise on tree-sitter.
 
 Usage:
     python repograph.py <repo-path> [-o REPOMAP.md]
 
-Standard library only. Python 3.8+.
+Standard library only (the optional tree-sitter backend needs a wheel). Python 3.8+.
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -191,6 +199,50 @@ for _cfg in LANGS.values():
 # Reverse index: extension -> language name.
 EXT_TO_LANG = {ext: name for name, cfg in LANGS.items() for ext in cfg["exts"]}
 
+# --------------------------------------------------------------------------- #
+# Inheritance ("extends"/"implements") patterns — heuristic, per language.
+#
+# Each entry yields (child, parents_blob, kind_for_blob) on a class/type header;
+# parents_blob is split on commas into individual base names. Languages model
+# inheritance differently (single base vs. interface list vs. trait impl), so the
+# regexes are tailored; absent languages simply contribute no inheritance edges.
+# --------------------------------------------------------------------------- #
+INHERIT = {
+    # class X(Base1, Base2): — every base treated as "extends".
+    "python": [(_c(r"^\s*class\s+(\w+)\s*\(([^)]*)\)"), "extends")],
+    # class X extends Y { / class X implements I, J { — captured separately.
+    "java": [
+        (_c(r"\b(?:class|interface)\s+(\w+)[^{]*?\bextends\s+([\w.<>, ]+?)(?:\s+implements|\s*\{|$)"), "extends"),
+        (_c(r"\bclass\s+(\w+)[^{]*?\bimplements\s+([\w.<>, ]+?)(?:\s*\{|$)"), "implements"),
+    ],
+    # class X extends Y implements I (TS) / class X extends Y (JS).
+    "javascript": [(_c(r"\bclass\s+(\w+)\s+extends\s+([\w.]+)"), "extends")],
+    "typescript": [
+        (_c(r"\bclass\s+(\w+)\s+extends\s+([\w.]+)"), "extends"),
+        (_c(r"\bclass\s+(\w+)[^{]*?\bimplements\s+([\w.<>, ]+?)(?:\s*\{|$)"), "implements"),
+        (_c(r"\binterface\s+(\w+)\s+extends\s+([\w.<>, ]+?)(?:\s*\{|$)"), "extends"),
+    ],
+    # class X < Y — Ruby single superclass.
+    "ruby": [(_c(r"^\s*class\s+(\w+)\s*<\s*([\w:]+)"), "extends")],
+    # class X : public Base1, Base2 — C++ (strip access specifiers when splitting).
+    "c": [(_c(r"\b(?:class|struct)\s+(\w+)\s*:\s*([\w:,<> ]+?)\s*\{"), "extends")],
+    # impl Trait for Type — Rust: Type implements Trait.
+    "rust": [(_c(r"^\s*impl\s+([\w:<>, ]+?)\s+for\s+(\w+)"), "_rust_impl")],
+}
+
+# Identifiers that look like calls (`name(`) but are language keywords, not
+# functions — filtered out so the call graph isn't polluted by control flow.
+_CALL_KEYWORDS = {
+    "if", "for", "while", "switch", "catch", "return", "with", "match", "case",
+    "elif", "except", "function", "def", "fn", "func", "class", "struct", "enum",
+    "interface", "trait", "and", "or", "not", "in", "is", "await", "yield",
+    "print", "len", "range", "super", "self", "new", "typeof", "sizeof",
+}
+
+# A call site: an identifier immediately followed by "(". `.method(` is captured
+# too — the leading separator is consumed so we get the method name alone.
+_CALL_RE = _c(r"(?:^|[^\w.])(\w+)\s*\(")
+
 # Comment markers used to grab a file's leading doc block.
 LINE_COMMENT = {
     "python": "#", "ruby": "#", "shell": "#", "elixir": "#",
@@ -268,7 +320,24 @@ _CTAGS_OK = None
 class Symbol:
     name: str
     kind: str
-    line: int  # 1-based
+    line: int  # 1-based, definition line
+    end: int = 0  # 1-based last line of the symbol's body; 0 = unknown
+
+
+@dataclass
+class Edge:
+    """A directed relationship between a symbol and a name it references.
+
+    `src` is the *unqualified* name of the enclosing symbol in this file (or ""
+    when the reference sits at file scope). `dst` is the referenced name, left
+    *unresolved* — query time matches it against the global definition table.
+    Keeping edges name-based (not pre-resolved) means a file's edges depend only
+    on that file, so the incremental cache stays correct per-file.
+    """
+    src: str    # enclosing symbol name, or "" for file scope
+    dst: str    # referenced name (unresolved)
+    kind: str   # "calls" | "extends" | "implements"
+    line: int   # 1-based site of the reference
 
 
 @dataclass
@@ -278,10 +347,11 @@ class FileNode:
     line_count: int
     content_hash: str = "" # sha1 of file bytes — drives incremental update
     gitsha: str = ""       # git blob sha (when tracked) — git-status fast path
-    build_key: str = ""    # "<symbols_level>:<ctags?>" — invalidates reuse on change
+    build_key: str = ""    # "<level>:<ctags?>:<backend>:<edges?>" — invalidates reuse
     doc: str = ""          # leading comment/docstring, trimmed
     symbols: list = field(default_factory=list)   # list[Symbol]
     imports: list = field(default_factory=list)   # list[str]
+    edges: list = field(default_factory=list)     # list[Edge]
 
 
 @dataclass
@@ -442,6 +512,95 @@ def extract_imports(lines, cfg) -> "list[str]":
     return order
 
 
+def assign_spans(symbols, total_lines: int) -> None:
+    """Fill in end lines for symbols lacking them (end == 0), in place.
+
+    Flat heuristic: a symbol runs until the next symbol's definition line (last
+    one to end of file). Enough to attribute a reference to its nearest enclosing
+    definition; tree-sitter and ctags supply exact ends when available.
+    """
+    ordered = sorted(range(len(symbols)), key=lambda i: symbols[i].line)
+    for pos, i in enumerate(ordered):
+        if symbols[i].end:
+            continue
+        if pos + 1 < len(ordered):
+            nxt = symbols[ordered[pos + 1]].line - 1
+        else:
+            nxt = total_lines
+        symbols[i].end = max(symbols[i].line, nxt)
+
+
+def _base_name(raw: str) -> str:
+    """Reduce a base-type expression to a bare identifier.
+
+    Strips generics, access specifiers, and namespace/package qualifiers, so
+    `public std::vector<T>` / `Foo.Bar<Baz>` collapse to `vector` / `Bar`.
+    """
+    raw = re.sub(r"<.*", "", raw or "")
+    raw = re.sub(r"\b(?:public|private|protected|virtual|final|abstract)\b", "", raw)
+    last = re.split(r"::|\.", raw.strip())[-1].strip()
+    return last if re.fullmatch(r"\w+", last or "") else ""
+
+
+def extract_inherits(lines, language: str) -> "list[Edge]":
+    """Heuristic extends/implements edges from class/type headers.
+
+    Tailored per language (see INHERIT); absent languages yield nothing. Names
+    are left unresolved — query time matches them to definitions.
+    """
+    pats = INHERIT.get(language)
+    if not pats:
+        return []
+    edges: "list[Edge]" = []
+    for i, line in enumerate(lines, start=1):
+        for pat, kind in pats:
+            m = pat.search(line)
+            if not m:
+                continue
+            if kind == "_rust_impl":  # `impl Trait for Type` → Type implements Trait
+                trait = _base_name(m.group(1))
+                if trait:
+                    edges.append(Edge(src=m.group(2), dst=trait,
+                                      kind="implements", line=i))
+                continue
+            child = m.group(1)
+            for base in m.group(2).split(","):
+                bn = _base_name(base)
+                if bn and bn != child:
+                    edges.append(Edge(src=child, dst=bn, kind=kind, line=i))
+    return edges
+
+
+def extract_calls(lines, symbols) -> "list[Edge]":
+    """Heuristic call edges: each `name(` site attributed to its nearest
+    enclosing definition (`src`), the callee name left unresolved (`dst`).
+
+    Approximate by design — it can't tell `a.run()` from `b.run()` and matches by
+    name only; language keywords and self-references are dropped, and (src, dst)
+    pairs are deduped (first site kept) to bound size.
+    """
+    sorted_syms = sorted(symbols, key=lambda s: s.line)
+    n = len(sorted_syms)
+    edges: "list[Edge]" = []
+    seen: "set[tuple]" = set()
+    si = 0
+    cur = ""  # enclosing symbol name; "" = file scope
+    for i, line in enumerate(lines, start=1):
+        while si < n and sorted_syms[si].line <= i:
+            cur = sorted_syms[si].name
+            si += 1
+        for m in _CALL_RE.finditer(line):
+            name = m.group(1)
+            if name in _CALL_KEYWORDS or name == cur or name.endswith("."):
+                continue
+            key = (cur, name)
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append(Edge(src=cur, dst=name, kind="calls", line=i))
+    return edges
+
+
 def ctags_available() -> bool:
     """True if a *universal*-ctags binary is on PATH (memoized).
 
@@ -489,7 +648,7 @@ def run_ctags(abs_paths, symbols_level: str) -> "dict[str, list[Symbol]]":
     try:
         proc = subprocess.run(
             [_CTAGS_BIN or "ctags", "--quiet", "--output-format=json",
-             "--fields=+nKzS", "-f", "-", "-L", "-"],
+             "--fields=+nKzSe", "-f", "-", "-L", "-"],
             input="\n".join(abs_paths),
             capture_output=True, text=True, timeout=300,
         )
@@ -528,7 +687,10 @@ def run_ctags(abs_paths, symbols_level: str) -> "dict[str, list[Symbol]]":
             continue
         if kind in _METHOD_KINDS:
             name = _qualify(name, scope)
-        out.setdefault(path, []).append(Symbol(name=name, kind=kind, line=line))
+        end = rec.get("end")
+        end = end if isinstance(end, int) and end >= line else 0
+        out.setdefault(path, []).append(
+            Symbol(name=name, kind=kind, line=line, end=end))
 
     for path, syms in out.items():
         # Dedupe on (name, kind) keeping the earliest line (proto+def, overloads),
@@ -540,6 +702,296 @@ def run_ctags(abs_paths, symbols_level: str) -> "dict[str, list[Symbol]]":
                 best[key] = s
         out[path] = sorted(best.values(), key=lambda s: s.line)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Optional tree-sitter backend (accurate symbols + call edges via real ASTs).
+#
+# Strictly opt-in (--tree-sitter): unlike ctags it is never auto-selected, so the
+# default behavior — and the zero-dependency guarantee — is unchanged. When the
+# `tree_sitter_language_pack` (or `tree_sitter_languages`) wheel is importable it
+# replaces the symbol layer for supported languages and supplies precise call
+# edges (exact enclosing scope + real call nodes, not `name(` heuristics).
+# Inheritance edges and imports stay regex; unsupported languages fall back fully.
+# --------------------------------------------------------------------------- #
+
+# our language name -> tree-sitter grammar name.
+TS_GRAMMAR = {
+    "python": "python", "javascript": "javascript", "typescript": "typescript",
+    "go": "go", "rust": "rust", "java": "java", "ruby": "ruby", "c": "c",
+}
+# .tsx / .jsx need the JSX-aware grammars.
+TS_GRAMMAR_BY_EXT = {".tsx": "tsx", ".jsx": "javascript", ".mts": "typescript",
+                     ".cts": "typescript"}
+
+# AST node type -> our kind, per grammar.
+TS_DEFS = {
+    "python": {"function_definition": "function", "class_definition": "class"},
+    "javascript": {"function_declaration": "function", "class_declaration": "class",
+                   "method_definition": "method",
+                   "generator_function_declaration": "function"},
+    "typescript": {"function_declaration": "function", "class_declaration": "class",
+                   "method_definition": "method", "interface_declaration": "interface",
+                   "type_alias_declaration": "type", "enum_declaration": "enum",
+                   "abstract_class_declaration": "class"},
+    "go": {"function_declaration": "function", "method_declaration": "method",
+           "type_spec": "type"},
+    "rust": {"function_item": "function", "struct_item": "struct",
+             "enum_item": "enum", "trait_item": "trait"},
+    "java": {"class_declaration": "class", "interface_declaration": "interface",
+             "enum_declaration": "enum", "method_declaration": "method"},
+    "ruby": {"method": "function", "class": "class", "module": "module",
+             "singleton_method": "function"},
+    "c": {"function_definition": "function", "struct_specifier": "struct"},
+}
+TS_DEFS["tsx"] = TS_DEFS["typescript"]
+# Node types that open a class scope (so nested functions qualify as Owner.method).
+TS_CLASS = {
+    "python": {"class_definition"}, "javascript": {"class_declaration"},
+    "typescript": {"class_declaration", "abstract_class_declaration"},
+    "tsx": {"class_declaration", "abstract_class_declaration"},
+    "java": {"class_declaration", "interface_declaration", "enum_declaration"},
+    "ruby": {"class", "module"}, "go": set(), "rust": set(), "c": set(),
+}
+# Call-expression node type per grammar, and the field naming the callee.
+TS_CALL = {
+    "python": ("call", "function"), "javascript": ("call_expression", "function"),
+    "typescript": ("call_expression", "function"), "tsx": ("call_expression", "function"),
+    "go": ("call_expression", "function"), "rust": ("call_expression", "function"),
+    "java": ("method_invocation", "name"), "ruby": ("call", "method"),
+    "c": ("call_expression", "function"),
+}
+
+_TS_BACKEND = None     # None=unprobed, False=unavailable, else the imported module
+_TS_PARSERS: dict = {}  # grammar name -> parser (or None)
+
+
+def _ts_backend():
+    """The tree-sitter parser-factory module, or False if none is importable."""
+    global _TS_BACKEND
+    if _TS_BACKEND is not None:
+        return _TS_BACKEND
+    for modname in ("tree_sitter_language_pack", "tree_sitter_languages"):
+        try:
+            mod = __import__(modname)
+        except Exception:
+            continue
+        if hasattr(mod, "get_parser"):
+            _TS_BACKEND = mod
+            return mod
+    _TS_BACKEND = False
+    return False
+
+
+def tree_sitter_available() -> bool:
+    return bool(_ts_backend())
+
+
+def _ts_parser(grammar: str):
+    if grammar in _TS_PARSERS:
+        return _TS_PARSERS[grammar]
+    mod = _ts_backend()
+    parser = None
+    if mod:
+        try:
+            parser = mod.get_parser(grammar)
+        except Exception:
+            parser = None
+    _TS_PARSERS[grammar] = parser
+    return parser
+
+
+def _ts_grammar(language: str, ext: str):
+    return TS_GRAMMAR_BY_EXT.get(ext) or TS_GRAMMAR.get(language)
+
+
+_TS_IDENTS = {"identifier", "type_identifier", "field_identifier",
+              "constant", "property_identifier"}
+
+# tree-sitter Python bindings disagree on surface API: the mainstream wheel
+# exposes node data as *properties* (node.type, node.start_point, node.children)
+# while some Rust-backed builds expose them as *methods* (node.kind(),
+# node.start_position(), node.child(i)). These accessors normalize both so the
+# backend works regardless of which binding the user has installed.
+
+
+def _ts_get(obj, name):
+    v = getattr(obj, name, None)
+    return v() if callable(v) else v
+
+
+def _ts_kind(node) -> str:
+    k = getattr(node, "type", None)
+    if k is None:
+        k = getattr(node, "kind", None)
+    k = k() if callable(k) else k
+    return k or ""
+
+
+def _ts_children(node):
+    ch = getattr(node, "children", None)
+    if ch is not None and not callable(ch):
+        return list(ch)
+    cnt = _ts_get(node, "child_count") or 0
+    return [node.child(i) for i in range(cnt)]
+
+
+def _ts_named_children(node):
+    ch = getattr(node, "named_children", None)
+    if ch is not None and not callable(ch):
+        return list(ch)
+    cnt = _ts_get(node, "named_child_count") or 0
+    return [node.named_child(i) for i in range(cnt)]
+
+
+def _ts_row(node, names) -> int:
+    for a in names:
+        p = getattr(node, a, None)
+        if p is None:
+            continue
+        if callable(p):
+            p = p()
+        if isinstance(p, (tuple, list)):
+            return p[0]
+        r = getattr(p, "row", None)
+        if r is not None:
+            return r
+    return 0
+
+
+def _ts_start(node):
+    return _ts_row(node, ("start_point", "start_position"))
+
+
+def _ts_end(node):
+    return _ts_row(node, ("end_point", "end_position"))
+
+
+def _ts_text(node, data: bytes) -> str:
+    return data[_ts_get(node, "start_byte"):_ts_get(node, "end_byte")].decode(
+        "utf-8", "replace")
+
+
+def _ts_def_name(node, data: bytes) -> str:
+    """Name of a definition node: its `name` field, else first identifier child."""
+    nn = node.child_by_field_name("name")
+    if nn is not None:
+        return _ts_text(nn, data)
+    # BFS for the first identifier — handles C declarators, Go type_spec, etc.
+    queue = _ts_children(node)
+    while queue:
+        c = queue.pop(0)
+        if _ts_kind(c) in _TS_IDENTS:
+            return _ts_text(c, data)
+        queue.extend(_ts_children(c))
+    return ""
+
+
+def _ts_callee(node, data: bytes, field: str) -> str:
+    """Bare name of a call's callee: descend a member/scoped expression to the
+    rightmost identifier (so `a.b.run()` and `pkg::run()` both yield `run`)."""
+    target = node.child_by_field_name(field)
+    if target is None:
+        return ""
+    while _ts_get(target, "named_child_count"):
+        kids = _ts_named_children(target)
+        if not kids:
+            break
+        last = kids[-1]
+        if _ts_kind(last) in _TS_IDENTS or _ts_kind(last) in (
+                "member_expression", "scoped_identifier", "selector_expression",
+                "field_expression", "scoped_type_identifier", "call"):
+            target = last
+        else:
+            break
+    txt = _ts_text(target, data)
+    return txt if re.fullmatch(r"\w+", txt or "") else ""
+
+
+def ts_extract(data: bytes, language: str, ext: str, symbols_level: str):
+    """Parse `data` with tree-sitter; return (symbols, call_edges) or None.
+
+    None means "no grammar for this file" → caller falls back to regex. Symbols
+    carry exact start/end lines; methods are qualified Owner.method. Call edges
+    are attributed to their exact enclosing definition.
+    """
+    grammar = _ts_grammar(language, ext)
+    if not grammar:
+        return None
+    parser = _ts_parser(grammar)
+    if parser is None:
+        return None
+    try:
+        try:
+            tree = parser.parse(data)                       # bytes (mainstream)
+        except TypeError:
+            tree = parser.parse(data.decode("utf-8", "replace"))  # str (Rust build)
+    except Exception:
+        return None
+    root = getattr(tree, "root_node", None)
+    if callable(root):
+        root = root()
+    if root is None:
+        return None
+
+    defs = TS_DEFS.get(grammar, {})
+    class_nodes = TS_CLASS.get(grammar, set())
+    call_type, call_field = TS_CALL.get(grammar, (None, None))
+    keep_members = symbols_level == "full"
+    symbols: "list[Symbol]" = []
+    edges: "list[Edge]" = []
+
+    def visit(node, enclosing: str, owner: str):
+        new_enclosing, new_owner = enclosing, owner
+        ntype = _ts_kind(node)
+        kind = defs.get(ntype)
+        if kind:
+            try:
+                name = _ts_def_name(node, data)
+            except Exception:
+                name = ""
+            if name:
+                k = "method" if (kind == "function" and owner) else kind
+                disp = f"{owner}.{name}" if (k == "method" and owner) else name
+                if k in _DEFAULT_KINDS or keep_members:
+                    symbols.append(Symbol(name=disp, kind=k,
+                                          line=_ts_start(node) + 1,
+                                          end=_ts_end(node) + 1))
+                new_enclosing = disp
+                if ntype in class_nodes:
+                    new_owner = name
+        if call_type and ntype == call_type:
+            try:
+                callee = _ts_callee(node, data, call_field)
+            except Exception:
+                callee = ""
+            if callee and callee not in _CALL_KEYWORDS and callee != enclosing:
+                edges.append(Edge(src=enclosing, dst=callee, kind="calls",
+                                  line=_ts_start(node) + 1))
+        for child in _ts_children(node):
+            visit(child, new_enclosing, new_owner)
+
+    try:
+        visit(root, "", "")
+    except RecursionError:
+        return None
+
+    # Dedupe symbols on (name, kind) keeping earliest; dedupe call edges (src,dst).
+    best: "dict[tuple, Symbol]" = {}
+    for s in symbols:
+        key = (s.name, s.kind)
+        if key not in best or s.line < best[key].line:
+            best[key] = s
+    syms = sorted(best.values(), key=lambda s: s.line)
+    seen: "set[tuple]" = set()
+    uniq: "list[Edge]" = []
+    for e in edges:
+        key = (e.src, e.dst)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(e)
+    return syms, uniq
 
 
 def extract_leading_doc(lines, language: str) -> str:
@@ -585,13 +1037,17 @@ def extract_leading_doc(lines, language: str) -> str:
 
 
 def analyze_bytes(rel: str, ext: str, data: bytes, digest: str,
-                  ctags_symbols=None, symbols_level: str = "defs") -> FileNode:
+                  symbols_override=None, symbols_level: str = "defs",
+                  edges_enabled: bool = False,
+                  call_edges_override=None) -> FileNode:
     """Build a FileNode from already-read bytes (binary already ruled out).
 
-    `ctags_symbols` (a list) replaces the regex symbol layer when provided;
-    `None` means "no ctags result for this file" → fall back to regex (this is
-    also the ctags-absent and ctags-blind path). Imports + doc are always regex.
-    `symbols_level="none"` suppresses symbols entirely.
+    `symbols_override` (a list) replaces the regex symbol layer when provided
+    (ctags or tree-sitter result); `None` means "no precise result for this
+    file" → regex fallback (also the backend-absent / backend-blind path).
+    Imports + doc + inheritance edges are always regex. `call_edges_override`
+    (from tree-sitter) replaces the heuristic `name(` call edges when given.
+    `symbols_level="none"` suppresses symbols (and therefore edges).
     """
     lines = data.decode("utf-8", "replace").splitlines()
     language = EXT_TO_LANG.get(ext, "")
@@ -602,12 +1058,20 @@ def analyze_bytes(rel: str, ext: str, data: bytes, digest: str,
         cfg = LANGS[language]
         if symbols_level == "none":
             node.symbols = []
-        elif ctags_symbols is not None:
-            node.symbols = ctags_symbols
+        elif symbols_override is not None:
+            node.symbols = symbols_override
         else:
             node.symbols = extract_symbols(lines, cfg)
         node.imports = extract_imports(lines, cfg)
         node.doc = extract_leading_doc(lines, language)
+        if edges_enabled and symbols_level != "none":
+            assign_spans(node.symbols, len(lines))
+            edges = extract_inherits(lines, language)
+            if call_edges_override is not None:
+                edges.extend(call_edges_override)
+            else:
+                edges.extend(extract_calls(lines, node.symbols))
+            node.edges = edges
     return node
 
 
@@ -630,12 +1094,13 @@ def read_file_bytes(path: Path):
 
 
 def process_file(path: Path, rel: str, cached: "FileNode | None",
-                 ctags_symbols=None, symbols_level: str = "defs"):
+                 symbols_override=None, symbols_level: str = "defs",
+                 edges_enabled: bool = False, call_edges_override=None):
     """Return (node, reused) for one file, or (None, False) if skipped.
 
     Reads the file's bytes once and hashes them. If the hash matches a cached
     node, that node is reused verbatim (no re-analysis) — the incremental fast
-    path. Otherwise the file is (re)analyzed (with ctags symbols if supplied).
+    path. Otherwise the file is (re)analyzed (with precise symbols if supplied).
     """
     read = read_file_bytes(path)
     if read is None:
@@ -644,7 +1109,8 @@ def process_file(path: Path, rel: str, cached: "FileNode | None",
     if cached is not None and cached.content_hash == digest:
         return cached, True
     return analyze_bytes(rel, path.suffix.lower(), data, digest,
-                         ctags_symbols, symbols_level), False
+                         symbols_override, symbols_level, edges_enabled,
+                         call_edges_override), False
 
 
 def find_readme_summary(root: Path) -> str:
@@ -690,17 +1156,19 @@ def path_selected(rel: str, include, exclude) -> bool:
 
 
 def build_repo(root: Path, include=None, exclude=None, cache=None,
-               use_ctags: bool = True, symbols_level: str = "defs") -> Repo:
+               use_ctags: bool = True, symbols_level: str = "defs",
+               use_tree_sitter: bool = False, edges: bool = False) -> Repo:
     """Build the repo graph, reusing unchanged files from `cache` if given.
 
     `cache` is a dict {rel_path: FileNode} from a previous run (see
     load_cache). Files whose content hash matches are reused unchanged; the
     rest are analyzed. Deleted files simply don't appear in the result.
 
-    When `use_ctags` and a universal-ctags binary is present, symbols for the
-    *changed* files are extracted by one batch ctags call; otherwise (or for
-    files ctags can't handle) the regex extractor is used. Imports + docs are
-    always regex.
+    Symbol backend, in precedence order: tree-sitter when `use_tree_sitter` and
+    a grammar pack is importable (precise symbols + call edges), else
+    universal-ctags when `use_ctags` and the binary is present, else regex. The
+    chosen backend runs only over the *changed* files. Imports + docs (+ regex
+    inheritance edges when `edges`) are always regex.
     """
     root = root.resolve()
     repo = Repo(root=root, name=root.name)
@@ -713,11 +1181,15 @@ def build_repo(root: Path, include=None, exclude=None, cache=None,
     blob = git_blob_shas(root)                 # None when not a git repo
     dirty = git_dirty_files(root) if blob is not None else set()
 
-    # A cached node is only reusable if it was produced under the same symbol
-    # profile (level + effective backend); otherwise its symbols are stale, so
-    # we re-analyze. ctags_effective is computed once and reused for Phase B.
-    ctags_effective = (use_ctags and symbols_level != "none" and ctags_available())
-    want_key = f"{symbols_level}:{int(ctags_effective)}"
+    # A cached node is only reusable if it was produced under the same profile
+    # (symbol level + effective backend + edges flag); otherwise its symbols or
+    # edges are stale, so we re-analyze. Resolved once and reused for Phase B.
+    ts_effective = (use_tree_sitter and symbols_level != "none"
+                    and tree_sitter_available())
+    ctags_effective = (not ts_effective and use_ctags
+                       and symbols_level != "none" and ctags_available())
+    backend = "ts" if ts_effective else ("ct" if ctags_effective else "rx")
+    want_key = f"{symbols_level}:{backend}:{int(edges)}"
 
     # Phase A — select, detect changes, reuse from cache. Defer analysis of
     # changed files so ctags can run over them in a single batch (Phase B).
@@ -755,19 +1227,34 @@ def build_repo(root: Path, include=None, exclude=None, cache=None,
             pending.append((path, rel, path.suffix.lower(), data, digest,
                             cur_gitsha or ""))
 
-    # Phase B — one batch ctags call over the changed files with a known language.
+    # Phase B — run the chosen precise backend over the changed files.
+    # ctags: one batch subprocess. tree-sitter: per-file in-process parse
+    # (also yields call edges). Both fall back to regex per file when blind.
     ctags_syms: "dict[str, list[Symbol]]" = {}
+    ts_results: "dict[str, tuple]" = {}  # str(path) -> (symbols, call_edges)
     if ctags_effective:
         abs_for_ctags = [
             str(p) for (p, _rel, ext, _d, _h, _g) in pending if EXT_TO_LANG.get(ext)
         ]
         ctags_syms = run_ctags(abs_for_ctags, symbols_level)
+    elif ts_effective:
+        for path, _rel, ext, data, _d, _g in pending:
+            if not EXT_TO_LANG.get(ext):
+                continue
+            res = ts_extract(data, EXT_TO_LANG[ext], ext, symbols_level)
+            if res is not None:
+                ts_results[str(path)] = res
 
     analyzed: "dict[str, FileNode]" = {}
     for path, rel, ext, data, digest, gitsha in pending:
-        # A None lookup → ctags absent or blind for this file → regex fallback.
-        cs = ctags_syms.get(str(path))
-        node = analyze_bytes(rel, ext, data, digest, cs, symbols_level)
+        # A None override → backend absent or blind for this file → regex fallback.
+        override = ctags_syms.get(str(path))
+        call_override = None
+        ts = ts_results.get(str(path))
+        if ts is not None:
+            override, call_override = ts[0], (ts[1] if edges else None)
+        node = analyze_bytes(rel, ext, data, digest, override, symbols_level,
+                             edges_enabled=edges, call_edges_override=call_override)
         node.gitsha = gitsha
         node.build_key = want_key
         analyzed[rel] = node
@@ -791,6 +1278,12 @@ def build_repo(root: Path, include=None, exclude=None, cache=None,
 
 
 def repo_to_dict(repo: Repo) -> dict:
+    def sym_dict(s):
+        d = {"name": s.name, "kind": s.kind, "line": s.line}
+        if s.end:  # omit unknown/zero ends to keep the artifact lean
+            d["end"] = s.end
+        return d
+
     def file_dict(f):
         d = {
             "path": f.rel_path,
@@ -798,11 +1291,14 @@ def repo_to_dict(repo: Repo) -> dict:
             "lines": f.line_count,
             "hash": f.content_hash,
             "doc": f.doc,
-            "symbols": [
-                {"name": s.name, "kind": s.kind, "line": s.line} for s in f.symbols
-            ],
+            "symbols": [sym_dict(s) for s in f.symbols],
             "imports": f.imports,
         }
+        if f.edges:  # only present when built with --edges
+            d["edges"] = [
+                {"src": e.src, "dst": e.dst, "kind": e.kind, "line": e.line}
+                for e in f.edges
+            ]
         if f.gitsha:  # omit when absent (non-git) to keep the artifact lean
             d["gitsha"] = f.gitsha
         if f.build_key:
@@ -827,8 +1323,17 @@ def files_from_dict(d: dict) -> "dict[str, FileNode]":
             gitsha=fd.get("gitsha", ""),
             build_key=fd.get("bk", ""),
             doc=fd.get("doc", ""),
-            symbols=[Symbol(**s) for s in fd.get("symbols", [])],
+            symbols=[
+                Symbol(name=s["name"], kind=s["kind"], line=s["line"],
+                       end=s.get("end", 0))
+                for s in fd.get("symbols", [])
+            ],
             imports=list(fd.get("imports", [])),
+            edges=[
+                Edge(src=e.get("src", ""), dst=e["dst"], kind=e["kind"],
+                     line=e.get("line", 0))
+                for e in fd.get("edges", [])
+            ],
         )
         out[node.rel_path] = node
     return out
@@ -942,6 +1447,22 @@ def render_markdown(repo: Repo) -> str:
         if f.imports:
             joined = ", ".join(f"`{imp}`" for imp in f.imports)
             out.append(f"Imports (heuristic): {joined}")
+            out.append("")
+        if f.edges:
+            inherit = [e for e in f.edges if e.kind in ("extends", "implements")]
+            calls = []
+            seen_c = set()
+            for e in f.edges:
+                if e.kind == "calls" and e.dst not in seen_c:
+                    seen_c.add(e.dst)
+                    calls.append(e.dst)
+            for e in inherit:
+                out.append(f"- `{e.kind}` {e.src} → `{e.dst}`")
+            if calls:
+                shown = calls[:40]
+                more = f" (+{len(calls) - 40} more)" if len(calls) > 40 else ""
+                out.append("Calls (heuristic): "
+                           + ", ".join(f"`{c}`" for c in shown) + more)
             out.append("")
 
     return "\n".join(out).rstrip() + "\n"
@@ -1126,6 +1647,212 @@ def def_locations(repo: Repo) -> "set[tuple]":
     return {(f.rel_path, s.line) for f, s in _iter_symbols(repo)}
 
 
+# --------------------------------------------------------------------------- #
+# Relationship queries over edges — callers / callees / impact / affected.
+#
+# Edges are name-based and unresolved (see Edge); these resolve them against the
+# global symbol table at query time. All lexical/structural — a call to `run` is
+# matched to *every* `run` definition, so results are approximate (more precise
+# with the tree-sitter backend, which records exact enclosing scopes). The map
+# must be built with edges (--edges, or via the query commands which force it).
+# --------------------------------------------------------------------------- #
+
+# Paths that look like test files — used by impact/affected to flag test fallout.
+_TEST_HINT = re.compile(
+    r"(?:^|/)(?:tests?|__tests__|specs?)(?:/|$)"   # a test/spec directory
+    r"|(?:^|[/_.])(?:test_|_test|spec_|_spec)"     # name prefix/suffix tokens
+    r"|\.(?:test|spec)\.",                          # foo.test.js / foo.spec.js
+    re.IGNORECASE)
+
+
+def is_test_path(rel: str) -> bool:
+    return bool(_TEST_HINT.search(rel))
+
+
+def _last(name: str) -> str:
+    """Bare last component of a (possibly qualified) symbol name."""
+    return name.rsplit(".", 1)[-1]
+
+
+def symbol_index(repo: Repo) -> "dict[str, list]":
+    """name -> [(rel_path, Symbol)], indexed by both full and bare-last name."""
+    idx: "dict[str, list]" = {}
+    for f in repo.files:
+        for s in f.symbols:
+            idx.setdefault(s.name, []).append((f.rel_path, s))
+            bare = _last(s.name)
+            if bare != s.name:
+                idx.setdefault(bare, []).append((f.rel_path, s))
+    return idx
+
+
+def _resolve(idx, name: str):
+    """Definition sites for a referenced name: exact, else bare-last match."""
+    return idx.get(name) or idx.get(_last(name)) or []
+
+
+def find_callees(repo: Repo, name: str, limit: int = 100):
+    """Symbols called from within the definition(s) of NAME.
+
+    Returns (callee, def_rel, def_line, call_line); def_rel is "" for callees
+    with no known definition in this repo (external/library calls).
+    """
+    idx = symbol_index(repo)
+    targets = _resolve(idx, name)
+    src_names = {s.name for (_r, s) in targets}
+    src_files = {r for (r, _s) in targets}
+    rows, seen = [], set()
+    for f in repo.files:
+        if f.rel_path not in src_files:
+            continue
+        for e in f.edges:
+            if e.kind != "calls" or e.src not in src_names:
+                continue
+            defs = _resolve(idx, e.dst)
+            dr, dl = (defs[0][0], defs[0][1].line) if defs else ("", 0)
+            key = (e.dst, dr, dl)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append((e.dst, dr, dl, e.line))
+    rows.sort(key=lambda r: (r[1] == "", r[1], r[2], r[0]))
+    return rows[:limit]
+
+
+def find_callers(repo: Repo, name: str, limit: int = 100):
+    """Sites that call NAME. Returns (rel_path, call_line, caller, caller_line).
+
+    `caller` is the enclosing symbol at the call site ("(file scope)" if none);
+    `caller_line` is that symbol's definition line (0 if unknown).
+    """
+    idx = symbol_index(repo)
+    want = _last(name)
+    rows, seen = [], set()
+    for f in repo.files:
+        for e in f.edges:
+            if e.kind != "calls":
+                continue
+            if e.dst != name and _last(e.dst) != want:
+                continue
+            caller = e.src or "(file scope)"
+            cl = 0
+            for (r, s) in idx.get(e.src, []):
+                if r == f.rel_path:
+                    cl = s.line
+                    break
+            key = (f.rel_path, e.line, caller)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append((f.rel_path, e.line, caller, cl))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return rows[:limit]
+
+
+def find_impact(repo: Repo, name: str, max_depth: int = 3, limit: int = 200):
+    """Transitive callers of NAME (the blast radius of changing it).
+
+    BFS up the reverse call graph to `max_depth`. Returns
+    (rows, files, test_files) where rows are (rel, caller, call_line, depth).
+    """
+    rev: "dict[str, list]" = {}
+    for f in repo.files:
+        for e in f.edges:
+            if e.kind == "calls":
+                rev.setdefault(_last(e.dst), []).append((f.rel_path, e.src, e.line))
+    visited, expanded = set(), set()
+    rows = []
+    frontier = [(_last(name), 0)]
+    while frontier:
+        bare, depth = frontier.pop(0)
+        if depth >= max_depth or bare in expanded:
+            continue
+        expanded.add(bare)
+        for (rel, src, line) in rev.get(bare, []):
+            key = (rel, src, line)
+            if key in visited:
+                continue
+            visited.add(key)
+            rows.append((rel, src or "(file scope)", line, depth + 1))
+            if src:
+                frontier.append((_last(src), depth + 1))
+    rows.sort(key=lambda r: (r[3], r[0], r[2]))
+    rows = rows[:limit]
+    files = sorted({r[0] for r in rows})
+    tests = [p for p in files if is_test_path(p)]
+    return rows, files, tests
+
+
+def file_dep_graph(repo: Repo) -> "dict[str, set]":
+    """{rel_path: set(rel_paths it depends on)} from imports + call edges.
+
+    Heuristic resolution: an import string is matched to a file by basename stem;
+    a call edge is matched to the file(s) defining that symbol name.
+    """
+    sym2files: "dict[str, set]" = {}
+    stem2file: "dict[str, set]" = {}
+    for f in repo.files:
+        for s in f.symbols:
+            sym2files.setdefault(_last(s.name), set()).add(f.rel_path)
+        stem = f.rel_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        stem2file.setdefault(stem, set()).add(f.rel_path)
+    deps: "dict[str, set]" = {f.rel_path: set() for f in repo.files}
+    for f in repo.files:
+        for imp in f.imports:
+            base = re.split(r"[\\/.]", imp.strip().rstrip("/"))[-1]
+            for cand in stem2file.get(base, ()):
+                if cand != f.rel_path:
+                    deps[f.rel_path].add(cand)
+        for e in f.edges:
+            if e.kind == "calls":
+                for cand in sym2files.get(_last(e.dst), ()):
+                    if cand != f.rel_path:
+                        deps[f.rel_path].add(cand)
+    return deps
+
+
+def find_affected(repo: Repo, changed, limit: int = 300):
+    """Files transitively depending on `changed` (reverse import/call reach).
+
+    Returns (test_files, other_files) — test files first since the common use is
+    "which tests should I run after editing these files".
+    """
+    deps = file_dep_graph(repo)
+    rev: "dict[str, set]" = {f.rel_path: set() for f in repo.files}
+    for a, bs in deps.items():
+        for b in bs:
+            rev.setdefault(b, set()).add(a)
+    changed = set(changed)
+    impacted: "set[str]" = set()
+    frontier = list(changed)
+    while frontier:
+        cur = frontier.pop()
+        for dep in rev.get(cur, ()):
+            if dep not in impacted and dep not in changed:
+                impacted.add(dep)
+                frontier.append(dep)
+    impacted = set(list(impacted)[:limit])
+    tests = sorted(p for p in impacted if is_test_path(p))
+    others = sorted(p for p in impacted if not is_test_path(p))
+    return tests, others
+
+
+def git_changed_files(root: Path) -> "list[str]":
+    """Changed paths vs HEAD (porcelain): staged + unstaged + untracked."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain", "-z"],
+            capture_output=True, check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    changed = []
+    for rec in out.stdout.decode("utf-8", "replace").split("\0"):
+        if rec and len(rec) > 3:
+            changed.append(rec[3:])
+    return changed
+
+
 def format_symbol_rows(rows) -> str:
     if not rows:
         return "(no matches)"
@@ -1144,6 +1871,55 @@ def format_ref_rows(rows) -> str:
     return "\n".join(
         f"{r[0]}:{r[1]}  {'[def] ' if r[2] else ''}{r[3]}" for r in rows
     )
+
+
+def format_callee_rows(rows) -> str:
+    if not rows:
+        return "(no callees — built without --edges, or none found)"
+    out = []
+    for callee, dr, dl, call_line in rows:
+        if dr:
+            out.append(f"{callee}  ->  {dr}:{dl}  (called at line {call_line})")
+        else:
+            out.append(f"{callee}  ->  (external/unresolved)  (called at line {call_line})")
+    return "\n".join(out)
+
+
+def format_caller_rows(rows) -> str:
+    if not rows:
+        return "(no callers — built without --edges, or none found)"
+    return "\n".join(
+        f"{rel}:{line}  in {caller}"
+        + (f" (def {rel}:{cl})" if cl else "")
+        for rel, line, caller, cl in rows
+    )
+
+
+def format_impact_rows(result) -> str:
+    rows, files, tests = result
+    if not rows:
+        return "(no impact — built without --edges, or nothing calls it)"
+    out = [f"Impact: {len(files)} file(s), {len(tests)} test file(s) affected", ""]
+    for rel, caller, line, depth in rows:
+        out.append(f"{'  ' * (depth - 1)}{rel}:{line}  {caller}  (depth {depth})")
+    if tests:
+        out.append("")
+        out.append("Affected tests: " + ", ".join(tests))
+    return "\n".join(out)
+
+
+def format_affected_rows(result) -> str:
+    tests, others = result
+    if not tests and not others:
+        return "(no dependents found — built without --edges, or none)"
+    out = [f"Affected: {len(tests)} test file(s), {len(others)} other file(s)", ""]
+    if tests:
+        out.append("Tests to run:")
+        out.extend(f"  {p}" for p in tests)
+    if others:
+        out.append("Other dependents:")
+        out.extend(f"  {p}" for p in others)
+    return "\n".join(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -1175,19 +1951,24 @@ git add "$ROOT/.repograph" 2>/dev/null || true
 """
 
 
-def _scope_flags(include, exclude) -> str:
-    """Render include/exclude globs as shell-quoted CLI flags to bake into the
-    hook, so refreshes use the same scope as `init`. Leading space when non-empty."""
+def _scope_flags(include, exclude, edges=False, use_tree_sitter=False) -> str:
+    """Render the build profile as shell-quoted CLI flags to bake into the hook,
+    so refreshes use the same scope as `init`. Leading space when non-empty."""
     parts = []
     for g in include or []:
         parts.append("--include " + shlex.quote(g))
     for g in exclude or []:
         parts.append("--exclude " + shlex.quote(g))
+    if edges:
+        parts.append("--edges")
+    if use_tree_sitter:
+        parts.append("--tree-sitter")
     return (" " + " ".join(parts)) if parts else ""
 
 
 def cmd_init(repo: Path, include, exclude, symbols_level: str,
-             use_ctags: bool) -> int:
+             use_ctags: bool, use_tree_sitter: bool = False,
+             edges: bool = False) -> int:
     """Scaffold the committed-map workflow into `repo`:
 
       1. build the initial .repograph/ map (index.txt + map.md + graph.json),
@@ -1206,7 +1987,8 @@ def cmd_init(repo: Path, include, exclude, symbols_level: str,
     cache_path = outdir / "graph.json"
     cache = load_cache(cache_path) if cache_path.exists() else {}
     graph = build_repo(repo, include=include, exclude=exclude, cache=cache,
-                       use_ctags=use_ctags, symbols_level=symbols_level)
+                       use_ctags=use_ctags, symbols_level=symbols_level,
+                       use_tree_sitter=use_tree_sitter, edges=edges)
     (outdir / "index.txt").write_text(render_index(graph), encoding="utf-8")
     (outdir / "map.md").write_text(render_markdown(graph), encoding="utf-8")
     cache_path.write_text(render_json(graph), encoding="utf-8")
@@ -1215,8 +1997,10 @@ def cmd_init(repo: Path, include, exclude, symbols_level: str,
     hooks = repo / ".githooks"
     hooks.mkdir(exist_ok=True)
     hook = hooks / "pre-commit"
-    hook.write_text(HOOK_TEMPLATE.format(scope=_scope_flags(include, exclude)),
-                    encoding="utf-8")
+    hook.write_text(
+        HOOK_TEMPLATE.format(
+            scope=_scope_flags(include, exclude, edges, use_tree_sitter)),
+        encoding="utf-8")
     hook.chmod(0o755)
 
     # 3. Activate for the current clone.
@@ -1241,6 +2025,70 @@ def cmd_init(repo: Path, include, exclude, symbols_level: str,
     print("  commit .repograph/ and .githooks/ so the map travels with the repo.",
           file=sys.stderr)
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# watch — rebuild on change. Stdlib only: poll mtimes, rebuild incrementally.
+# --------------------------------------------------------------------------- #
+
+
+def _repo_signature(root: Path) -> dict:
+    """{abs_path: mtime_ns} over the repo's files — a cheap change fingerprint."""
+    sig: dict = {}
+    for p in list_files(root):
+        try:
+            if p.is_file():
+                sig[str(p)] = p.stat().st_mtime_ns
+        except OSError:
+            pass
+    return sig
+
+
+def cmd_watch(args, need_edges: bool) -> int:
+    """Rebuild the map incrementally whenever a watched file changes.
+
+    Polls file mtimes every --interval seconds (no third-party watcher, keeping
+    the zero-dependency promise); each change triggers an incremental build that
+    rewrites the output and refreshes the cache. Runs until interrupted.
+    """
+    root = args.repo.resolve()
+    render = RENDERERS[args.format]
+
+    def rebuild() -> Repo:
+        cache = {}
+        if args.cache and args.cache.exists():
+            cache = load_cache(args.cache)
+        repo = build_repo(
+            root, include=args.include, exclude=args.exclude, cache=cache,
+            use_ctags=not args.no_ctags, symbols_level=args.symbols,
+            use_tree_sitter=args.tree_sitter, edges=need_edges,
+        )
+        if args.cache:
+            args.cache.write_text(render_json(repo), encoding="utf-8")
+        rendered = render(repo)
+        if args.output:
+            args.output.write_text(rendered, encoding="utf-8")
+        else:
+            sys.stdout.write(rendered)
+        return repo
+
+    repo = rebuild()
+    dest = str(args.output) if args.output else "stdout"
+    print(f"repograph watch: built {len(repo.files)} files -> {dest}; "
+          f"polling every {args.interval}s (Ctrl-C to stop)", file=sys.stderr)
+    prev = _repo_signature(root)
+    try:
+        while True:
+            time.sleep(max(0.1, args.interval))
+            cur = _repo_signature(root)
+            if cur != prev:
+                prev = cur
+                r = rebuild()
+                print(f"repograph watch: {r.analyzed} changed, {r.reused} reused, "
+                      f"{r.dropped} removed", file=sys.stderr)
+    except KeyboardInterrupt:
+        print("\nrepograph watch: stopped", file=sys.stderr)
+        return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -1299,6 +2147,25 @@ def main(argv=None) -> int:
         "--ctags-path", metavar="BIN", default=None,
         help="path to the universal-ctags binary (default: 'ctags' on PATH)",
     )
+    parser.add_argument(
+        "--tree-sitter", action="store_true",
+        help="use the optional tree-sitter backend for precise symbols + call "
+             "edges (needs the tree_sitter_language_pack wheel; opt-in)",
+    )
+    parser.add_argument(
+        "--edges", action="store_true",
+        help="extract relationship edges (calls, extends, implements) and "
+             "include them in the map/json (the call-graph queries force this on)",
+    )
+    parser.add_argument(
+        "--watch", action="store_true",
+        help="rebuild incrementally whenever a file changes (until Ctrl-C); "
+             "pairs with -o and --cache",
+    )
+    parser.add_argument(
+        "--interval", type=float, default=1.0, metavar="SEC",
+        help="--watch poll interval in seconds (default: 1.0)",
+    )
     q = parser.add_argument_group("query modes (print lookups instead of a map)")
     q.add_argument("--find", metavar="NAME",
                    help="print where symbols matching NAME are defined (path:line)")
@@ -1306,6 +2173,15 @@ def main(argv=None) -> int:
                    help="rank symbols by word/doc overlap with QUERY (lexical)")
     q.add_argument("--refs", metavar="NAME",
                    help="print lexical usages of NAME (git grep; approximate)")
+    q.add_argument("--callers", metavar="NAME",
+                   help="print call sites of NAME (needs edges; approximate)")
+    q.add_argument("--callees", metavar="NAME",
+                   help="print symbols called from within NAME (needs edges)")
+    q.add_argument("--impact", metavar="NAME",
+                   help="print the transitive callers of NAME — its blast radius")
+    q.add_argument("--affected", nargs="?", const="", metavar="FILES",
+                   help="print files/tests depending on FILES (comma-separated; "
+                        "omit the value to use git's changed files)")
     parser.add_argument(
         "--init", action="store_true",
         help="scaffold the committed-map workflow into REPO: write .repograph/, "
@@ -1325,7 +2201,22 @@ def main(argv=None) -> int:
 
     if args.init:
         return cmd_init(args.repo, include=args.include, exclude=args.exclude,
-                        symbols_level=args.symbols, use_ctags=not args.no_ctags)
+                        symbols_level=args.symbols, use_ctags=not args.no_ctags,
+                        use_tree_sitter=args.tree_sitter, edges=args.edges)
+
+    # The relationship queries need edges; force them on for those runs even if
+    # --edges wasn't passed (the persisted artifact still honors --edges).
+    edge_query = any(x is not None for x in
+                     (args.callers, args.callees, args.impact, args.affected))
+    need_edges = args.edges or edge_query
+
+    if args.tree_sitter and not tree_sitter_available():
+        print("warning: --tree-sitter requested but no tree_sitter_language_pack "
+              "/ tree_sitter_languages wheel is importable; falling back",
+              file=sys.stderr)
+
+    if args.watch:
+        return cmd_watch(args, need_edges)
 
     cache = {}
     if args.cache and args.cache.exists() and not args.rebuild:
@@ -1334,10 +2225,13 @@ def main(argv=None) -> int:
     repo = build_repo(
         args.repo, include=args.include, exclude=args.exclude, cache=cache,
         use_ctags=not args.no_ctags, symbols_level=args.symbols,
+        use_tree_sitter=args.tree_sitter, edges=need_edges,
     )
 
-    # Persist/refresh the cache as JSON (same schema as --format json).
-    if args.cache:
+    # Persist/refresh the cache as JSON (same schema as --format json). Skip when
+    # a query forced edges on but --edges wasn't asked for, so the persisted
+    # cache keeps the user's chosen (edge-free) profile.
+    if args.cache and (args.edges or not edge_query):
         args.cache.write_text(render_json(repo), encoding="utf-8")
 
     # Query modes short-circuit: print the lookup, not a map.
@@ -1350,6 +2244,20 @@ def main(argv=None) -> int:
     if args.refs is not None:
         print(format_ref_rows(find_refs(repo.root, args.refs,
                                         definitions=def_locations(repo))))
+        return 0
+    if args.callers is not None:
+        print(format_caller_rows(find_callers(repo, args.callers)))
+        return 0
+    if args.callees is not None:
+        print(format_callee_rows(find_callees(repo, args.callees)))
+        return 0
+    if args.impact is not None:
+        print(format_impact_rows(find_impact(repo, args.impact)))
+        return 0
+    if args.affected is not None:
+        changed = ([c.strip() for c in args.affected.split(",") if c.strip()]
+                   if args.affected else git_changed_files(repo.root))
+        print(format_affected_rows(find_affected(repo, changed)))
         return 0
 
     rendered = RENDERERS[args.format](repo)

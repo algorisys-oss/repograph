@@ -109,8 +109,10 @@ index); `--symbols none` drops symbols entirely. Imports/docs are always regex.
 - Without universal-ctags, the regex fallback catches only top-level-ish defs —
   class/object **methods are missed** for JS/TS/Java. Installing
   universal-ctags closes this.
-- Imports/relationships are always the weakest layer; there's no call graph or
-  type resolution.
+- Imports/relationships are the weakest layer. The call graph (`--edges` and the
+  `--callers`/`--callees`/`--impact`/`--affected` queries) is heuristic and
+  name-based — no type resolution, so it's a navigation aid to verify, not ground
+  truth. The tree-sitter backend makes it much more precise.
 - Treat the index as a high-recall router, not ground truth: if a symbol isn't
   listed, fall back to a scoped grep in the file the index points you to.
 
@@ -131,12 +133,40 @@ python3 "$REPOGRAPH_PY" . --refs handleClick        # where a name is USED (appr
 - `--refs` — lexical usages (git grep under the hood); name-based, so approximate
   (can't tell `a.connect()` from `b.connect()`). Use for "who references X".
 
+## Relationship / call-graph queries
+
+These build a call graph (`--edges` turns on automatically) so you can reason
+about *connections*, not just locations. Approximate — name-based, so verify
+before relying on them; far more precise with the tree-sitter backend below.
+
+```bash
+python3 "$REPOGRAPH_PY" . --callers build_repo    # who calls this?
+python3 "$REPOGRAPH_PY" . --callees cmd_init       # what does this call?
+python3 "$REPOGRAPH_PY" . --impact analyze_bytes   # blast radius + affected tests
+python3 "$REPOGRAPH_PY" . --affected src/app.py    # files/tests depending on these
+python3 "$REPOGRAPH_PY" . --affected               # …using git's changed files
+```
+
+- `--impact` is ideal before a risky change: it lists the transitive callers and
+  flags which **test files** are affected.
+- `--affected` with no args reads git's changed files — a quick "what to re-test".
+
+## Precise backend (optional tree-sitter)
+
+For accurate symbols **and** call edges (attributed to the exact enclosing scope
+from a real AST, not regex), add `--tree-sitter` after a one-time
+`pip install tree-sitter-language-pack`. Covers Python, JS/TS, Go, Rust, Java,
+Ruby, C; other files fall back to ctags/regex. Without the wheel, `--tree-sitter`
+just warns and falls back, so it's always safe to pass.
+
 ## Optional: MCP server
 
 This skill drives the CLI directly — that's all you need. Optionally, the same
 library is wrapped as a stdlib-only MCP server (`repograph_mcp.py` in the repo)
-exposing four tools — `repo_index`, `find_symbol`, `search`, `find_refs` — for
-MCP clients (e.g. Google Antigravity) or sessions where calling a tool beats
-shelling out. If the `repograph` MCP tools are available, prefer `find_symbol`
-for "where is X defined", `search` for by-intent, `find_refs` for "who uses X",
-and `repo_index` for routing. See the README's "Use as an MCP server" section.
+exposing eight tools — `repo_index`, `find_symbol`, `search`, `find_refs`,
+`callers`, `callees`, `impact`, `affected` — for MCP clients (e.g. Google
+Antigravity) or sessions where calling a tool beats shelling out. If the
+`repograph` MCP tools are available, prefer `find_symbol` for "where is X
+defined", `search` for by-intent, `find_refs` for "who uses X", `callers`/
+`callees`/`impact` for the call graph, and `repo_index` for routing. See the
+README's "Use as an MCP server" section.

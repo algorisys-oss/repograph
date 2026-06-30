@@ -90,6 +90,23 @@ python repograph.py /path/to/repo -f index --no-ctags         # force regex back
 python repograph.py . --find build_repo        # where is a symbol defined?
 python repograph.py . --search "parse message" # rank symbols by name/doc words
 python repograph.py . --refs run_ctags         # where is a name used? (approx.)
+
+# Relationship / call-graph queries (auto-build the call graph; approximate):
+python repograph.py . --callers build_repo     # who calls this?
+python repograph.py . --callees cmd_init        # what does this call?
+python repograph.py . --impact analyze_bytes    # blast radius (transitive callers)
+python repograph.py . --affected repograph.py   # which files/tests depend on these?
+python repograph.py . --affected                # …using git's changed files
+
+# Persist relationship edges (calls/extends/implements) into the map + json:
+python repograph.py /path/to/repo --edges -f md -o REPOMAP.md
+
+# Optional tree-sitter backend — precise symbols + call edges (real ASTs):
+pip install tree-sitter-language-pack            # one-time, optional
+python repograph.py /path/to/repo --tree-sitter --edges -f index
+
+# Watch mode — rebuild incrementally on every change (Ctrl-C to stop):
+python repograph.py /path/to/repo -o REPOMAP.md --cache .repograph.json --watch
 ```
 
 Links in the Markdown output are relative to the repo root, so they resolve when
@@ -113,14 +130,18 @@ repograph in-process, so it runs anywhere `python3` does and works in any MCP
 client (Claude Code, Google Antigravity, Cursor, …). Delete the file and nothing
 else changes.
 
-It exposes two tools:
+It exposes these tools:
 
 | Tool | What it does |
 |------|--------------|
-| `repo_index` | Build/refresh the index (cached, incremental) and return it for routing. Args: `path?`, `include?`, `exclude?`, `symbols?`, `no_ctags?`, `rebuild?` |
+| `repo_index` | Build/refresh the index (cached, incremental) and return it for routing. Args: `path?`, `include?`, `exclude?`, `symbols?`, `no_ctags?`, `tree_sitter?`, `edges?`, `rebuild?` |
 | `find_symbol` | Find where a symbol is **defined** → `path:line  kind  name` rows (exact matches first; finds qualified `Owner.method`). Args: `query`, `path?`, `kind?`, `limit?` |
 | `search` | Lexical **by-intent** symbol search — ranks by word-token overlap of the query with symbol names *and* file doc comments (`retry request` → `retryRequest`). Not semantic. Args: `query`, `path?`, `limit?` |
 | `find_refs` | Find where an identifier is **used** → `path:line [def] text` (git grep; approximate, name-based). Args: `name`, `path?`, `limit?` |
+| `callers` | **Who calls** a function/method → `path:line in <enclosing symbol>` (heuristic call graph; precise with `tree_sitter`). Args: `name`, `path?`, `limit?` |
+| `callees` | **What a symbol calls** → `callee -> def path:line` (external/unresolved flagged). Args: `name`, `path?`, `limit?` |
+| `impact` | **Blast radius** of changing a symbol — its transitive callers, with affected test files called out. Args: `name`, `path?`, `max_depth?` |
+| `affected` | Given **changed files**, the files/tests that depend on them (tests first). Args: `files?` (array or comma string; omit for git changes), `path?` |
 
 Register it by pointing any MCP client at `python3 .../repograph_mcp.py`:
 
@@ -216,9 +237,63 @@ the MCP tools) refresh the cache on every call, so they're never stale.
 ### Data model (the "graph")
 
 - **Nodes:** directories, files (path, language, line count), symbols
-  (name, kind, line).
-- **Edges:** *contains* (dir→file, file→symbol) and *imports* (file→module,
-  heuristic).
+  (name, kind, line, and — with `--edges` — end line).
+- **Edges:** *contains* (dir→file, file→symbol), *imports* (file→module,
+  heuristic), and — with `--edges` — *calls* / *extends* / *implements*
+  (symbol→name, resolved to definitions at query time).
+
+## Relationships & the call graph (`--edges`)
+
+By default the map is a flat index of *where things are*. Pass `--edges` (or use
+any of the relationship queries, which turn it on automatically) to also extract
+*how things connect*:
+
+- **`calls`** — within each definition's body, the names it calls. Attributed to
+  the enclosing symbol so the graph is per-function, not per-file.
+- **`extends` / `implements`** — class/type inheritance from declaration headers.
+
+These power four queries, mirroring what a heavier code-intelligence tool gives
+you, but kept honest about being approximate:
+
+| Query | Question it answers |
+|-------|---------------------|
+| `--callers NAME` | Who calls `NAME`? |
+| `--callees NAME` | What does `NAME` call? (definitions resolved; external calls flagged) |
+| `--impact NAME` | If I change `NAME`, what's the blast radius? (transitive callers, **affected tests flagged**) |
+| `--affected FILES` | Which files/tests depend on these changed files? (omit `FILES` to use git's changed set) |
+
+Edges are **name-based and resolved at query time**, never pre-bound — so a file's
+edges depend only on that file and the incremental cache stays correct. The
+tradeoff is the same one repograph is always honest about: a call to `run` matches
+*every* `run` definition, comments/strings can leak into the regex call finder,
+and there's no type resolution. It's a navigation aid, not ground truth — **verify
+before relying on it.** The tree-sitter backend (below) makes it much more precise
+by attributing calls to their exact enclosing scope from a real AST.
+
+## Backends: regex → ctags → tree-sitter
+
+Symbols (and, with `--edges`, call edges) come from one of three backends, in
+precedence order. The default stays **zero-dependency**; the better backends are
+strictly opt-in or auto-detected, and any file a backend can't handle falls back
+to regex.
+
+| Backend | How it's selected | What it gives you |
+|---------|-------------------|-------------------|
+| **regex** (built-in) | always available; the floor | top-level defs + heuristic `name(` call edges; zero deps |
+| **universal-ctags** | auto, when `ctags` is on `PATH` (unless `--no-ctags`) | precise symbols + qualified methods across ~150 languages; exact symbol **end lines** |
+| **tree-sitter** | opt-in with `--tree-sitter` | real ASTs: precise symbols **and** call edges attributed to the exact enclosing scope (Python, JS/TS, Go, Rust, Java, Ruby, C) |
+
+Enable tree-sitter with a one-time `pip install tree-sitter-language-pack` (or
+`tree-sitter-languages`); without it, `--tree-sitter` warns and falls back. The
+cache is **backend- and edges-aware** (each entry records `<level>:<backend>:<edges>`),
+so switching backends or toggling `--edges` re-analyzes only what's affected.
+
+## Watch mode (`--watch`)
+
+`--watch` rebuilds the map incrementally whenever a file changes and rewrites the
+output + cache, until you Ctrl-C. It polls file mtimes (no third-party watcher, so
+the zero-dependency promise holds) at `--interval` seconds (default 1.0). Pair it
+with `-o` and `--cache` to keep a committed map continuously fresh while you work.
 
 ## Token efficiency
 
