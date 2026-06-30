@@ -519,45 +519,56 @@ def extract_imports(lines, cfg) -> "list[str]":
 
 # Python: `from <module> import a, b as c` (single line, optionally parenthesized).
 _PY_FROM = _c(r"^\s*from\s+(\.*[\w.]*)\s+import\s+(.+)$")
+# Python: `import a.b` / `import a.b as c` (binds a callable receiver name).
+_PY_IMPORT = _c(r"^\s*import\s+([\w.]+)(?:\s+as\s+(\w+))?\s*$")
 # JS/TS: `import <clause> from '<module>'` and bare `import '<module>'`.
 _JS_IMPORT = _c(r"^\s*import\s+(.+?)\s+from\s+['\"]([^'\"]+)['\"]")
 _JS_NAME = _c(r"(\w+)(?:\s+as\s+(\w+))?")
+# Go: `import "path"` or `alias "path"` (single line or inside an import block).
+_GO_IMPORT_ONE = _c(r'^\s*import\s+(?:(\w+|\.|_)\s+)?"([^"]+)"')
+_GO_BLOCK_LINE = _c(r'^\s*(?:(\w+|\.|_)\s+)?"([^"]+)"')
+# Java: `import a.b.C;` / `import static a.b.C.m;`.
+_JAVA_IMPORT = _c(r"^\s*import\s+(static\s+)?([\w.]+)\s*;")
 
 
 def extract_import_bindings(lines, language: str) -> "list[tuple]":
     """Map locally-bound names to the module they came from: [(local_name, module)].
 
-    Drives import-resolution of call edges (`helper()` → the `helper` defined in
-    the file `./utils` resolves to). Heuristic and single-line; only the import
-    forms that bind a usable name are captured. Other languages → [] (no bindings).
+    Drives import-resolution of call edges — both *free* calls (`helper()` from a
+    JS/Python `import`) and *qualified* ones (`util.Func()` in Go, `C.method()` in
+    Java, where the receiver IS the imported name). Heuristic and mostly
+    single-line. Other languages → [] (no bindings).
     """
     out: "list[tuple]" = []
     if language == "python":
         for line in lines:
             m = _PY_FROM.search(line)
-            if not m:
+            if m:
+                module = m.group(1)
+                names = m.group(2).strip().strip("()").rstrip("\\").strip()
+                if names != "*":
+                    for chunk in names.split(","):
+                        chunk = chunk.strip()
+                        if chunk:
+                            local = chunk.split()[-1]  # "a" | "a as b" -> last
+                            if re.fullmatch(r"\w+", local):
+                                out.append((local, module))
                 continue
-            module = m.group(1)
-            names = m.group(2).strip().strip("()").rstrip("\\").strip()
-            if names == "*":
-                continue
-            for chunk in names.split(","):
-                chunk = chunk.strip()
-                if not chunk:
-                    continue
-                parts = chunk.split()
-                # "a" | "a as b" -> local name is the last token
-                local = parts[-1]
-                if re.fullmatch(r"\w+", local):
-                    out.append((local, module))
+            m = _PY_IMPORT.search(line)
+            if m:
+                module, alias = m.group(1), m.group(2)
+                # bind a simple receiver name: the alias, or a single-segment module
+                if alias:
+                    out.append((alias, module))
+                elif "." not in module:
+                    out.append((module, module))
     elif language in ("javascript", "typescript"):
         for line in lines:
             m = _JS_IMPORT.search(line)
             if not m:
                 continue
             clause, module = m.group(1).strip(), m.group(2)
-            # default import: leading bare identifier before any "{" or ","
-            head = clause.split("{")[0].split(",")[0].strip()
+            head = clause.split("{")[0].split(",")[0].strip()  # default import
             if re.fullmatch(r"\w+", head):
                 out.append((head, module))
             nm = re.search(r"\{([^}]*)\}", clause)
@@ -569,7 +580,48 @@ def extract_import_bindings(lines, language: str) -> "list[tuple]":
             ns = re.search(r"\*\s+as\s+(\w+)", clause)
             if ns:
                 out.append((ns.group(1), module))
+    elif language == "go":
+        in_block = False
+        for line in lines:
+            stripped = line.strip()
+            if not in_block:
+                if re.match(r"^\s*import\s*\($", line):
+                    in_block = True
+                    continue
+                m = _GO_IMPORT_ONE.search(line)
+                if m:
+                    _go_bind(out, m.group(1), m.group(2))
+            else:
+                if stripped.startswith(")"):
+                    in_block = False
+                    continue
+                m = _GO_BLOCK_LINE.search(line)
+                if m:
+                    _go_bind(out, m.group(1), m.group(2))
+    elif language == "java":
+        for line in lines:
+            m = _JAVA_IMPORT.search(line)
+            if not m:
+                continue
+            is_static, path = bool(m.group(1)), m.group(2)
+            if path.endswith(".*"):
+                continue  # wildcard import binds no single name
+            parts = path.split(".")
+            if is_static:
+                # `import static a.b.C.m` -> name m, defined in class file a/b/C
+                out.append((parts[-1], ".".join(parts[:-1])))
+            else:
+                out.append((parts[-1], path))  # class C bound to its full path
     return out
+
+
+def _go_bind(out, alias, path):
+    """Record a Go import binding: local package name -> import path."""
+    if alias in (".", "_"):
+        return  # dot/blank imports bind no usable receiver
+    local = alias or path.rsplit("/", 1)[-1]  # default: last path element
+    if re.fullmatch(r"\w+", local or ""):
+        out.append((local, path))
 
 
 def assign_spans(symbols, total_lines: int) -> None:
@@ -1958,12 +2010,48 @@ def _resolve_js_module(importer_rel: str, module: str, file_set) -> "str | None"
     return None
 
 
-def _resolve_module(importer_rel, module, language, file_set):
+def _resolve_go_package(import_path: str, dir_files) -> "list[str]":
+    """Resolve a Go import path to its package's repo files.
+
+    No go.mod parsing: suffix-match the import path against repo directories
+    (longest/most-specific suffix wins), so `github.com/me/proj/util` finds the
+    repo dir `util` (or `proj/util`). External packages match nothing → [].
+    """
+    parts = [p for p in import_path.split("/") if p]
+    for k in range(len(parts), 0, -1):
+        suff = "/".join(parts[-k:])
+        hits = [d for d in dir_files if d == suff or d.endswith("/" + suff)]
+        if hits:
+            return dir_files[min(hits, key=len)]
+    return []
+
+
+def _resolve_java_class(class_path: str, file_set) -> "list[str]":
+    """Resolve a Java fully-qualified class (a.b.C) to its source file, suffix-
+    matching so a source root prefix (src/main/java/…) is tolerated."""
+    cand = class_path.replace(".", "/") + ".java"
+    if cand in file_set:
+        return [cand]
+    suff = "/" + cand
+    hits = [p for p in file_set if p.endswith(suff)]
+    return [min(hits, key=len)] if hits else []
+
+
+def _resolve_module_files(importer_rel, module, language, file_set,
+                          dir_files) -> "list[str]":
+    """Candidate repo file(s) an import refers to. Python/JS/Java resolve to one
+    file; Go resolves to its package directory's files."""
     if language == "python":
-        return _resolve_py_module(importer_rel, module, file_set)
+        f = _resolve_py_module(importer_rel, module, file_set)
+        return [f] if f else []
     if language in ("javascript", "typescript"):
-        return _resolve_js_module(importer_rel, module, file_set)
-    return None
+        f = _resolve_js_module(importer_rel, module, file_set)
+        return [f] if f else []
+    if language == "go":
+        return _resolve_go_package(module, dir_files)
+    if language == "java":
+        return _resolve_java_class(module, file_set)
+    return []
 
 
 def resolve_edges(repo: Repo) -> "list[ResolvedEdge]":
@@ -1974,11 +2062,27 @@ def resolve_edges(repo: Repo) -> "list[ResolvedEdge]":
     bindings_of = {f.rel_path: dict(f.import_bindings) for f in repo.files}
     by_file: dict = {}   # (file, bare_name) -> [line, …]
     glob: dict = {}      # bare_name -> [(file, line), …]
+    dir_files: dict = {}  # dir -> [files] (for Go package resolution)
     for f in repo.files:
         for s in f.symbols:
             bare = _last(s.name)
             by_file.setdefault((f.rel_path, bare), []).append(s.line)
             glob.setdefault(bare, []).append((f.rel_path, s.line))
+        d = f.rel_path.rsplit("/", 1)[0] if "/" in f.rel_path else ""
+        dir_files.setdefault(d, []).append(f.rel_path)
+
+    def via_import(rf, name, dst):
+        """Resolve `dst` through the file's import binding of `name` (the local
+        name or receiver). Returns (file, line) or None."""
+        mod = bindings_of.get(rf, {}).get(name)
+        if not mod:
+            return None
+        for tf in _resolve_module_files(rf, mod, lang_of.get(rf, ""),
+                                        file_set, dir_files):
+            lines = by_file.get((tf, dst))
+            if lines:
+                return (tf, min(lines))
+        return None
 
     out: "list[ResolvedEdge]" = []
     for f in repo.files:
@@ -2004,26 +2108,31 @@ def resolve_edges(repo: Repo) -> "list[ResolvedEdge]":
                         break
                 if target:
                     r.conf, r.prov = "high", "super"
-            # Tier 1c — receiver is a known class name (Foo.bar() static-ish).
+            # Tier 1c — receiver is an imported package/class (Go `util.Func()`,
+            # Java `C.method()`, Python `mod.func()`): resolve via that import.
+            # Tried before the class registry because the import names the exact
+            # package, disambiguating same-named classes.
+            if target is None and e.recv:
+                target = via_import(rf, e.recv, e.dst)
+                if target:
+                    r.conf, r.prov = "high", "import"
+            # Tier 1d — receiver is a known class name (Foo.bar() static-ish, or
+            # a same-package class with no import).
             if target is None and e.recv and e.recv in classes:
                 target = _lookup_method(classes, e.recv, e.dst)
                 if target:
                     r.conf, r.prov = "high", "type"
             # Tier 2 — free call resolves to a same-file definition, else through
-            # an import binding to the defining file.
+            # an import binding of the called name to the defining file.
             if target is None and not e.recv:
                 local = by_file.get((rf, e.dst))
                 if local:
                     target = (rf, min(local))
                     r.conf, r.prov = "high", "local"
                 else:
-                    mod = bindings_of.get(rf, {}).get(e.dst)
-                    if mod:
-                        tf = _resolve_module(rf, mod, lang_of.get(rf, ""), file_set)
-                        lines = by_file.get((tf, e.dst)) if tf else None
-                        if lines:
-                            target = (tf, min(lines))
-                            r.conf, r.prov = "high", "import"
+                    target = via_import(rf, e.dst, e.dst)
+                    if target:
+                        r.conf, r.prov = "high", "import"
             # Tier 4 — global name fallback (today's behavior, now labeled).
             if target is None:
                 cands = glob.get(e.dst, [])

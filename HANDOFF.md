@@ -203,8 +203,21 @@ adding deps; honest limits below.
      take `min_conf`; CLI `--strict` / `--min-confidence`, mirrored as MCP
      `strict`/`min_confidence`. Formatters print the level (`[medium]`).
    - 15 new tests (33 total for edges/resolution); **84 pass** (8 ts-gated).
-   Still out (Phase 3/4, deliberately deferred): Go/Java import resolvers, and
-   receiver-variable type tracking (`x = Foo(); x.run()`).
+7. **Go + Java import resolution (Phase 3) — DONE** (2026-06-30, branch
+   `feat/go-java-resolution`): extends resolution to the *receiver-qualified*
+   call models. Go `util.Func()` and Java `Util.method()` aren't free calls — the
+   receiver IS the import — so a new receiver-import tier (1c) resolves them:
+   - Bindings: Go `import "p/q/util"`/grouped blocks/aliases → `util`→path; Java
+     `import a.b.C;` (+ `import static`) → `C`→`a.b.C`; Python `import x as y`.
+   - Resolvers (no go.mod / source-root parse — suffix matching): Go import path →
+     repo package dir (longest suffix wins, beats a same-named decoy); Java FQCN →
+     `a/b/C.java` tolerating a `src/main/java/…` prefix.
+   - The import tier runs before the class-registry tier so the exact package
+     disambiguates same-named classes. Go resolves on any backend (top-level funcs
+     are regex-visible); Java needs ctags/tree-sitter (regex misses methods).
+   - 8 new tests; **92 pass** (9 ts-gated).
+   Still out (Phase 4, deliberately deferred): receiver-variable type tracking
+   (`x = Foo(); x.run()`).
    Still deliberately out (would break the zero-dep default): **embeddings** for
    *true* semantic search. CJS `module.exports` names in the regex path also
    still missing.

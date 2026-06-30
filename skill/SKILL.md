@@ -138,10 +138,12 @@ python3 "$REPOGRAPH_PY" . --refs handleClick        # where a name is USED (appr
 
 These build a **resolved** call graph (`--edges` turns on automatically) so you
 can reason about *connections*, not just locations. Each edge carries a
-**confidence**: `self`/`super` calls bind through the class hierarchy, imported
-names bind to their defining file — those are *high*; an ambiguous global
-name-match is *medium*/*low*. Rows show the level (`[medium]`); pass `--strict`
-(or `--min-confidence high`) to keep only edges you can trust.
+**confidence**: `self`/`super` calls bind through the class hierarchy, and
+imported calls bind to their defining file — Python/JS-TS free imports, Go
+`util.Func()` package imports, Java `Util.method()` class imports — those are
+*high*; an ambiguous global name-match is *medium*/*low*. Rows show the level
+(`[medium]`); pass `--strict` (or `--min-confidence high`) to keep only edges you
+can trust.
 
 ```bash
 python3 "$REPOGRAPH_PY" . --callers build_repo            # who calls this?
