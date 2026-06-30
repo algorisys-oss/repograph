@@ -239,9 +239,12 @@ _CALL_KEYWORDS = {
     "print", "len", "range", "super", "self", "new", "typeof", "sizeof",
 }
 
-# A call site: an identifier immediately followed by "(". `.method(` is captured
-# too — the leading separator is consumed so we get the method name alone.
+# A free call site: an identifier immediately followed by "(", not preceded by a
+# "." (those are method calls, captured separately with their receiver below).
 _CALL_RE = _c(r"(?:^|[^\w.])(\w+)\s*\(")
+# A method call `recv.name(`: captures the receiver and the called name so the
+# resolver can bind it (e.g. `self.run()` → the enclosing class's `run`).
+_METHOD_CALL_RE = _c(r"(\w+)\s*\.\s*(\w+)\s*\(")
 
 # Comment markers used to grab a file's leading doc block.
 LINE_COMMENT = {
@@ -338,6 +341,7 @@ class Edge:
     dst: str    # referenced name (unresolved)
     kind: str   # "calls" | "extends" | "implements"
     line: int   # 1-based site of the reference
+    recv: str = ""  # call receiver token: self/this/super, a var name, or "" (calls)
 
 
 @dataclass
@@ -352,6 +356,7 @@ class FileNode:
     symbols: list = field(default_factory=list)   # list[Symbol]
     imports: list = field(default_factory=list)   # list[str]
     edges: list = field(default_factory=list)     # list[Edge]
+    import_bindings: list = field(default_factory=list)  # list[(local_name, module)]
 
 
 @dataclass
@@ -512,6 +517,61 @@ def extract_imports(lines, cfg) -> "list[str]":
     return order
 
 
+# Python: `from <module> import a, b as c` (single line, optionally parenthesized).
+_PY_FROM = _c(r"^\s*from\s+(\.*[\w.]*)\s+import\s+(.+)$")
+# JS/TS: `import <clause> from '<module>'` and bare `import '<module>'`.
+_JS_IMPORT = _c(r"^\s*import\s+(.+?)\s+from\s+['\"]([^'\"]+)['\"]")
+_JS_NAME = _c(r"(\w+)(?:\s+as\s+(\w+))?")
+
+
+def extract_import_bindings(lines, language: str) -> "list[tuple]":
+    """Map locally-bound names to the module they came from: [(local_name, module)].
+
+    Drives import-resolution of call edges (`helper()` → the `helper` defined in
+    the file `./utils` resolves to). Heuristic and single-line; only the import
+    forms that bind a usable name are captured. Other languages → [] (no bindings).
+    """
+    out: "list[tuple]" = []
+    if language == "python":
+        for line in lines:
+            m = _PY_FROM.search(line)
+            if not m:
+                continue
+            module = m.group(1)
+            names = m.group(2).strip().strip("()").rstrip("\\").strip()
+            if names == "*":
+                continue
+            for chunk in names.split(","):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                parts = chunk.split()
+                # "a" | "a as b" -> local name is the last token
+                local = parts[-1]
+                if re.fullmatch(r"\w+", local):
+                    out.append((local, module))
+    elif language in ("javascript", "typescript"):
+        for line in lines:
+            m = _JS_IMPORT.search(line)
+            if not m:
+                continue
+            clause, module = m.group(1).strip(), m.group(2)
+            # default import: leading bare identifier before any "{" or ","
+            head = clause.split("{")[0].split(",")[0].strip()
+            if re.fullmatch(r"\w+", head):
+                out.append((head, module))
+            nm = re.search(r"\{([^}]*)\}", clause)
+            if nm:
+                for chunk in nm.group(1).split(","):
+                    g = _JS_NAME.search(chunk.strip())
+                    if g:
+                        out.append((g.group(2) or g.group(1), module))
+            ns = re.search(r"\*\s+as\s+(\w+)", clause)
+            if ns:
+                out.append((ns.group(1), module))
+    return out
+
+
 def assign_spans(symbols, total_lines: int) -> None:
     """Fill in end lines for symbols lacking them (end == 0), in place.
 
@@ -572,12 +632,14 @@ def extract_inherits(lines, language: str) -> "list[Edge]":
 
 
 def extract_calls(lines, symbols) -> "list[Edge]":
-    """Heuristic call edges: each `name(` site attributed to its nearest
-    enclosing definition (`src`), the callee name left unresolved (`dst`).
+    """Heuristic call edges: each call site attributed to its nearest enclosing
+    definition (`src`), the callee name left unresolved (`dst`).
 
-    Approximate by design — it can't tell `a.run()` from `b.run()` and matches by
-    name only; language keywords and self-references are dropped, and (src, dst)
-    pairs are deduped (first site kept) to bound size.
+    Method calls `recv.name(` capture the receiver token (`recv`) — `self`/`this`
+    or a variable — which the resolver later uses to bind the call to a specific
+    definition. Free calls `name(` get an empty receiver. Approximate by design:
+    language keywords and self-references are dropped, and (src, dst, recv) triples
+    are deduped (first site kept) to bound size.
     """
     sorted_syms = sorted(symbols, key=lambda s: s.line)
     n = len(sorted_syms)
@@ -589,11 +651,27 @@ def extract_calls(lines, symbols) -> "list[Edge]":
         while si < n and sorted_syms[si].line <= i:
             cur = sorted_syms[si].name
             si += 1
+        # Method calls first (recv.name(...)), so we can record the receiver and
+        # mark those spans handled; then free calls that aren't method tails.
+        method_spans = []
+        for m in _METHOD_CALL_RE.finditer(line):
+            recv, name = m.group(1), m.group(2)
+            method_spans.append(m.span(2))
+            if name in _CALL_KEYWORDS or name == cur:
+                continue
+            key = (cur, name, recv)
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append(Edge(src=cur, dst=name, kind="calls", line=i, recv=recv))
         for m in _CALL_RE.finditer(line):
             name = m.group(1)
             if name in _CALL_KEYWORDS or name == cur or name.endswith("."):
                 continue
-            key = (cur, name)
+            # skip if this `name(` is the tail of a method call already recorded
+            if any(s0 <= m.start(1) < s1 for (s0, s1) in method_spans):
+                continue
+            key = (cur, name, "")
             if key in seen:
                 continue
             seen.add(key)
@@ -887,12 +965,26 @@ def _ts_def_name(node, data: bytes) -> str:
     return ""
 
 
-def _ts_callee(node, data: bytes, field: str) -> str:
-    """Bare name of a call's callee: descend a member/scoped expression to the
-    rightmost identifier (so `a.b.run()` and `pkg::run()` both yield `run`)."""
-    target = node.child_by_field_name(field)
-    if target is None:
+# Fields that, on a call/member node, name the receiver (object) part.
+_TS_RECV_FIELDS = ("object", "receiver", "operand", "value")
+
+
+def _ts_simple_ident(node, data: bytes) -> str:
+    """Text of `node` if it's a bare identifier-ish token (self/this/super or a
+    plain name), else "" — used to capture a *simple* call receiver only."""
+    if node is None:
         return ""
+    if _ts_kind(node) in _TS_IDENTS or _ts_kind(node) in (
+            "this", "super", "self", "identifier"):
+        txt = _ts_text(node, data)
+        return txt if re.fullmatch(r"\w+", txt or "") else ""
+    return ""
+
+
+def _ts_rightmost(node, data: bytes) -> str:
+    """Descend a member/scoped expression to its rightmost identifier
+    (so `a.b.run()` and `pkg::run()` both yield `run`)."""
+    target = node
     while _ts_get(target, "named_child_count"):
         kids = _ts_named_children(target)
         if not kids:
@@ -906,6 +998,32 @@ def _ts_callee(node, data: bytes, field: str) -> str:
             break
     txt = _ts_text(target, data)
     return txt if re.fullmatch(r"\w+", txt or "") else ""
+
+
+def _ts_call_target(node, data: bytes, field: str):
+    """(callee_name, receiver) for a call node.
+
+    `receiver` is the simple object a method is called on — `self`/`this`/`super`
+    or a bare variable name — or "" for a free function call or a complex
+    receiver. It's what lets the resolver bind `self.run()` to the enclosing
+    class's `run` rather than every `run` in the repo.
+    """
+    recv = ""
+    # Languages whose call node carries an explicit receiver field (Java, Ruby).
+    for rf in _TS_RECV_FIELDS:
+        rn = node.child_by_field_name(rf)
+        if rn is not None:
+            recv = _ts_simple_ident(rn, data)
+            break
+    target = node.child_by_field_name(field)
+    if target is None:
+        return "", recv
+    # Otherwise split a member-like callee `X.y` into receiver X + name y.
+    if not recv and _ts_get(target, "named_child_count"):
+        kids = _ts_named_children(target)
+        if len(kids) >= 2:
+            recv = _ts_simple_ident(kids[0], data)
+    return _ts_rightmost(target, data), recv
 
 
 def ts_extract(data: bytes, language: str, ext: str, symbols_level: str):
@@ -962,12 +1080,12 @@ def ts_extract(data: bytes, language: str, ext: str, symbols_level: str):
                     new_owner = name
         if call_type and ntype == call_type:
             try:
-                callee = _ts_callee(node, data, call_field)
+                callee, recv = _ts_call_target(node, data, call_field)
             except Exception:
-                callee = ""
+                callee, recv = "", ""
             if callee and callee not in _CALL_KEYWORDS and callee != enclosing:
                 edges.append(Edge(src=enclosing, dst=callee, kind="calls",
-                                  line=_ts_start(node) + 1))
+                                  line=_ts_start(node) + 1, recv=recv))
         for child in _ts_children(node):
             visit(child, new_enclosing, new_owner)
 
@@ -976,7 +1094,9 @@ def ts_extract(data: bytes, language: str, ext: str, symbols_level: str):
     except RecursionError:
         return None
 
-    # Dedupe symbols on (name, kind) keeping earliest; dedupe call edges (src,dst).
+    # Dedupe symbols on (name, kind) keeping earliest; dedupe call edges on
+    # (src, dst, recv) so calls with distinct receivers stay separate (the
+    # receiver is what the resolver needs to disambiguate them).
     best: "dict[tuple, Symbol]" = {}
     for s in symbols:
         key = (s.name, s.kind)
@@ -986,7 +1106,7 @@ def ts_extract(data: bytes, language: str, ext: str, symbols_level: str):
     seen: "set[tuple]" = set()
     uniq: "list[Edge]" = []
     for e in edges:
-        key = (e.src, e.dst)
+        key = (e.src, e.dst, e.recv)
         if key in seen:
             continue
         seen.add(key)
@@ -1072,6 +1192,7 @@ def analyze_bytes(rel: str, ext: str, data: bytes, digest: str,
             else:
                 edges.extend(extract_calls(lines, node.symbols))
             node.edges = edges
+            node.import_bindings = extract_import_bindings(lines, language)
     return node
 
 
@@ -1189,7 +1310,9 @@ def build_repo(root: Path, include=None, exclude=None, cache=None,
     ctags_effective = (not ts_effective and use_ctags
                        and symbols_level != "none" and ctags_available())
     backend = "ts" if ts_effective else ("ct" if ctags_effective else "rx")
-    want_key = f"{symbols_level}:{backend}:{int(edges)}"
+    # Edge tag is versioned ("e3" = edges carry call receivers + import bindings)
+    # so that bumping the edge schema invalidates only edge-enabled cache entries.
+    want_key = f"{symbols_level}:{backend}:{'e3' if edges else '0'}"
 
     # Phase A — select, detect changes, reuse from cache. Defer analysis of
     # changed files so ctags can run over them in a single batch (Phase B).
@@ -1295,10 +1418,14 @@ def repo_to_dict(repo: Repo) -> dict:
             "imports": f.imports,
         }
         if f.edges:  # only present when built with --edges
-            d["edges"] = [
-                {"src": e.src, "dst": e.dst, "kind": e.kind, "line": e.line}
-                for e in f.edges
-            ]
+            def edge_dict(e):
+                ed = {"src": e.src, "dst": e.dst, "kind": e.kind, "line": e.line}
+                if e.recv:
+                    ed["recv"] = e.recv
+                return ed
+            d["edges"] = [edge_dict(e) for e in f.edges]
+        if f.import_bindings:  # [(local, module)] — present only with --edges
+            d["ibind"] = [[n, m] for (n, m) in f.import_bindings]
         if f.gitsha:  # omit when absent (non-git) to keep the artifact lean
             d["gitsha"] = f.gitsha
         if f.build_key:
@@ -1331,9 +1458,10 @@ def files_from_dict(d: dict) -> "dict[str, FileNode]":
             imports=list(fd.get("imports", [])),
             edges=[
                 Edge(src=e.get("src", ""), dst=e["dst"], kind=e["kind"],
-                     line=e.get("line", 0))
+                     line=e.get("line", 0), recv=e.get("recv", ""))
                 for e in fd.get("edges", [])
             ],
+            import_bindings=[tuple(b) for b in fd.get("ibind", [])],
         )
         out[node.rel_path] = node
     return out
@@ -1691,91 +1819,338 @@ def _resolve(idx, name: str):
     return idx.get(name) or idx.get(_last(name)) or []
 
 
-def find_callees(repo: Repo, name: str, limit: int = 100):
-    """Symbols called from within the definition(s) of NAME.
+# --------------------------------------------------------------------------- #
+# Edge resolution — bind each name-based call edge to a *specific* definition,
+# with a confidence level, instead of matching every same-named symbol.
+#
+# This runs as a separate in-memory pass over the assembled repo; it is NOT
+# persisted into the per-file cache (which stays raw + per-file correct). Tiers,
+# high → low confidence: self/super/typed-receiver (via the class hierarchy),
+# same-file local def, then a global name fallback. The receiver token captured
+# on each edge is what makes the high-confidence tiers possible.
+# --------------------------------------------------------------------------- #
 
-    Returns (callee, def_rel, def_line, call_line); def_rel is "" for callees
-    with no known definition in this repo (external/library calls).
+# Confidence ordering for filtering/sorting.
+CONF_RANK = {"high": 3, "medium": 2, "low": 1, "external": 0}
+
+# Receiver tokens that mean "the current instance/class".
+_SELF_RECV = {"self", "this", "me", "cls", "Self"}
+
+# Symbol kinds that define a class-like scope (own methods, can have bases).
+_CLASS_KINDS_REG = {"class", "struct", "interface", "trait", "module",
+                    "protocol", "object"}
+
+
+@dataclass
+class ResolvedEdge:
+    src_file: str       # file the call is in
+    src: str            # enclosing symbol (caller), "(file scope)" if none
+    dst: str            # callee name (unqualified)
+    recv: str           # receiver token at the call site
+    call_line: int      # where the call appears
+    dst_file: str = ""  # resolved definition file ("" = external/unresolved)
+    dst_line: int = 0   # resolved definition line
+    conf: str = "low"   # high | medium | low | external
+    prov: str = "name"  # how it resolved: self/super/type/local/name-*/external
+    ncand: int = 0      # candidate count at the name-fallback tier
+
+
+def class_registry(repo: Repo) -> dict:
+    """name -> {files, methods:{bare->(file,line)}, bases:set} over all classes.
+
+    Methods come from qualified `Owner.method` symbols; bases from extends/
+    implements edges. Keyed by bare class name globally (approximate but enough
+    to walk an inheritance chain for method resolution).
     """
-    idx = symbol_index(repo)
-    targets = _resolve(idx, name)
-    src_names = {s.name for (_r, s) in targets}
-    src_files = {r for (r, _s) in targets}
-    rows, seen = [], set()
+    classes: dict = {}
+
+    def ci(name):
+        return classes.setdefault(
+            name, {"files": set(), "methods": {}, "bases": set()})
+
     for f in repo.files:
-        if f.rel_path not in src_files:
-            continue
+        for s in f.symbols:
+            if "." in s.name and s.kind == "method":
+                owner, _, m = s.name.rpartition(".")
+                ci(owner)["methods"].setdefault(m, (f.rel_path, s.line))
+            elif s.kind in _CLASS_KINDS_REG:
+                ci(s.name)["files"].add(f.rel_path)
         for e in f.edges:
-            if e.kind != "calls" or e.src not in src_names:
-                continue
-            defs = _resolve(idx, e.dst)
-            dr, dl = (defs[0][0], defs[0][1].line) if defs else ("", 0)
-            key = (e.dst, dr, dl)
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append((e.dst, dr, dl, e.line))
-    rows.sort(key=lambda r: (r[1] == "", r[1], r[2], r[0]))
-    return rows[:limit]
+            if e.kind in ("extends", "implements"):
+                ci(e.src)["bases"].add(e.dst)
+    return classes
 
 
-def find_callers(repo: Repo, name: str, limit: int = 100):
-    """Sites that call NAME. Returns (rel_path, call_line, caller, caller_line).
+def _lookup_method(classes, cls, method, seen=None):
+    """Find `method` on `cls` or, transitively, its bases. (file, line) or None."""
+    seen = seen if seen is not None else set()
+    if cls in seen:
+        return None
+    seen.add(cls)
+    info = classes.get(cls)
+    if not info:
+        return None
+    if method in info["methods"]:
+        return info["methods"][method]
+    for base in info["bases"]:
+        hit = _lookup_method(classes, base, method, seen)
+        if hit:
+            return hit
+    return None
 
-    `caller` is the enclosing symbol at the call site ("(file scope)" if none);
-    `caller_line` is that symbol's definition line (0 if unknown).
-    """
-    idx = symbol_index(repo)
-    want = _last(name)
-    rows, seen = [], set()
+
+_JS_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
+
+
+def _posix_join_norm(base_dir: str, rel: str):
+    """Normalize `rel` (which may contain ./ ../) against POSIX `base_dir`."""
+    parts = base_dir.split("/") if base_dir else []
+    for seg in rel.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if parts:
+                parts.pop()
+            else:
+                return None  # escaped the repo root
+        else:
+            parts.append(seg)
+    return "/".join(parts)
+
+
+def _resolve_py_module(importer_rel: str, module: str, file_set) -> "str | None":
+    """Resolve a Python import module ("a.b", ".a", "..a") to a repo file."""
+    level = len(module) - len(module.lstrip("."))
+    rest = module.lstrip(".")
+    parts = rest.split(".") if rest else []
+    if level == 0:
+        base_parts = []                       # absolute: from the repo root
+    else:
+        imp_dir = importer_rel.rsplit("/", 1)[0] if "/" in importer_rel else ""
+        base_parts = imp_dir.split("/") if imp_dir else []
+        for _ in range(level - 1):            # each extra dot climbs a package
+            if base_parts:
+                base_parts.pop()
+    base = "/".join(base_parts + parts)
+    for cand in ((base + ".py", base + "/__init__.py") if base else ()):
+        if cand in file_set:
+            return cand
+    return None
+
+
+def _resolve_js_module(importer_rel: str, module: str, file_set) -> "str | None":
+    """Resolve a relative JS/TS import ("./x", "../y/z") to a repo file (with
+    extension + index resolution). Bare specifiers (node_modules) → None."""
+    if not module.startswith("."):
+        return None
+    imp_dir = importer_rel.rsplit("/", 1)[0] if "/" in importer_rel else ""
+    target = _posix_join_norm(imp_dir, module)
+    if target is None:
+        return None
+    if target in file_set:
+        return target
+    for ext in _JS_EXTS:
+        if target + ext in file_set:
+            return target + ext
+    for ext in _JS_EXTS:
+        if target + "/index" + ext in file_set:
+            return target + "/index" + ext
+    return None
+
+
+def _resolve_module(importer_rel, module, language, file_set):
+    if language == "python":
+        return _resolve_py_module(importer_rel, module, file_set)
+    if language in ("javascript", "typescript"):
+        return _resolve_js_module(importer_rel, module, file_set)
+    return None
+
+
+def resolve_edges(repo: Repo) -> "list[ResolvedEdge]":
+    """Resolve every call edge to a concrete definition with a confidence level."""
+    classes = class_registry(repo)
+    file_set = {f.rel_path for f in repo.files}
+    lang_of = {f.rel_path: f.language for f in repo.files}
+    bindings_of = {f.rel_path: dict(f.import_bindings) for f in repo.files}
+    by_file: dict = {}   # (file, bare_name) -> [line, …]
+    glob: dict = {}      # bare_name -> [(file, line), …]
     for f in repo.files:
+        for s in f.symbols:
+            bare = _last(s.name)
+            by_file.setdefault((f.rel_path, bare), []).append(s.line)
+            glob.setdefault(bare, []).append((f.rel_path, s.line))
+
+    out: "list[ResolvedEdge]" = []
+    for f in repo.files:
+        rf = f.rel_path
         for e in f.edges:
             if e.kind != "calls":
                 continue
-            if e.dst != name and _last(e.dst) != want:
-                continue
-            caller = e.src or "(file scope)"
-            cl = 0
-            for (r, s) in idx.get(e.src, []):
-                if r == f.rel_path:
-                    cl = s.line
-                    break
-            key = (f.rel_path, e.line, caller)
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append((f.rel_path, e.line, caller, cl))
-    rows.sort(key=lambda r: (r[0], r[1]))
+            r = ResolvedEdge(src_file=rf, src=e.src or "(file scope)",
+                             dst=e.dst, recv=e.recv, call_line=e.line)
+            owner = e.src.rpartition(".")[0] if "." in e.src else ""
+            target = None
+
+            # Tier 1a — self/this/cls: method on the enclosing class hierarchy.
+            if e.recv in _SELF_RECV and owner:
+                target = _lookup_method(classes, owner, e.dst)
+                if target:
+                    r.conf, r.prov = "high", "self"
+            # Tier 1b — super: skip the current class, search its bases.
+            elif e.recv == "super" and owner:
+                for base in classes.get(owner, {}).get("bases", ()):
+                    target = _lookup_method(classes, base, e.dst)
+                    if target:
+                        break
+                if target:
+                    r.conf, r.prov = "high", "super"
+            # Tier 1c — receiver is a known class name (Foo.bar() static-ish).
+            if target is None and e.recv and e.recv in classes:
+                target = _lookup_method(classes, e.recv, e.dst)
+                if target:
+                    r.conf, r.prov = "high", "type"
+            # Tier 2 — free call resolves to a same-file definition, else through
+            # an import binding to the defining file.
+            if target is None and not e.recv:
+                local = by_file.get((rf, e.dst))
+                if local:
+                    target = (rf, min(local))
+                    r.conf, r.prov = "high", "local"
+                else:
+                    mod = bindings_of.get(rf, {}).get(e.dst)
+                    if mod:
+                        tf = _resolve_module(rf, mod, lang_of.get(rf, ""), file_set)
+                        lines = by_file.get((tf, e.dst)) if tf else None
+                        if lines:
+                            target = (tf, min(lines))
+                            r.conf, r.prov = "high", "import"
+            # Tier 4 — global name fallback (today's behavior, now labeled).
+            if target is None:
+                cands = glob.get(e.dst, [])
+                r.ncand = len(cands)
+                if len(cands) == 1:
+                    target, r.conf, r.prov = cands[0], "medium", "name-unique"
+                elif len(cands) > 1:
+                    target, r.conf, r.prov = cands[0], "low", "name-ambiguous"
+                else:
+                    r.conf, r.prov = "external", "external"
+
+            if target:
+                r.dst_file, r.dst_line = target
+            out.append(r)
+    return out
+
+
+def _def_line_map(repo: Repo) -> dict:
+    """(rel_path, symbol_name) -> earliest definition line."""
+    m: dict = {}
+    for f in repo.files:
+        for s in f.symbols:
+            key = (f.rel_path, s.name)
+            if key not in m or s.line < m[key]:
+                m[key] = s.line
+    return m
+
+
+def _def_sites(repo: Repo, name: str) -> "set[tuple]":
+    """Definition (file, line) sites of NAME — exact name or bare-last match."""
+    want = _last(name)
+    sites = set()
+    for f in repo.files:
+        for s in f.symbols:
+            if s.name == name or _last(s.name) == want:
+                sites.add((f.rel_path, s.line))
+    return sites
+
+
+def find_callees(repo: Repo, name: str, limit: int = 100, min_conf: str = "low",
+                 resolved=None):
+    """Symbols called from within the definition(s) of NAME.
+
+    Returns (callee, def_rel, def_line, call_line, conf); def_rel is "" for
+    callees with no known definition in this repo (external/library calls).
+    `min_conf` drops edges below a confidence floor (high|medium|low).
+    """
+    resolved = resolve_edges(repo) if resolved is None else resolved
+    want = _last(name)
+    floor = CONF_RANK.get(min_conf, 1)
+    rows, seen = [], set()
+    for r in resolved:
+        if r.src != name and _last(r.src) != want:
+            continue
+        if r.conf != "external" and CONF_RANK[r.conf] < floor:
+            continue
+        key = (r.dst, r.dst_file, r.dst_line)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((r.dst, r.dst_file, r.dst_line, r.call_line, r.conf))
+    rows.sort(key=lambda x: (x[1] == "", x[1], x[2], x[0]))
     return rows[:limit]
 
 
-def find_impact(repo: Repo, name: str, max_depth: int = 3, limit: int = 200):
-    """Transitive callers of NAME (the blast radius of changing it).
+def find_callers(repo: Repo, name: str, limit: int = 100, min_conf: str = "low",
+                 resolved=None):
+    """Sites that call NAME, via *resolved* edges (so `a.run()`/`b.run()` no
+    longer both match a `run` you didn't mean — at least at high confidence).
 
-    BFS up the reverse call graph to `max_depth`. Returns
-    (rows, files, test_files) where rows are (rel, caller, call_line, depth).
+    Returns (rel_path, call_line, caller, caller_line, conf).
     """
-    rev: "dict[str, list]" = {}
-    for f in repo.files:
-        for e in f.edges:
-            if e.kind == "calls":
-                rev.setdefault(_last(e.dst), []).append((f.rel_path, e.src, e.line))
-    visited, expanded = set(), set()
-    rows = []
-    frontier = [(_last(name), 0)]
-    while frontier:
-        bare, depth = frontier.pop(0)
-        if depth >= max_depth or bare in expanded:
+    resolved = resolve_edges(repo) if resolved is None else resolved
+    sites = _def_sites(repo, name)
+    dlines = _def_line_map(repo)
+    floor = CONF_RANK.get(min_conf, 1)
+    rows, seen = [], set()
+    for r in resolved:
+        if (r.dst_file, r.dst_line) not in sites:
             continue
-        expanded.add(bare)
-        for (rel, src, line) in rev.get(bare, []):
-            key = (rel, src, line)
+        if CONF_RANK[r.conf] < floor:
+            continue
+        cl = dlines.get((r.src_file, r.src), 0)
+        key = (r.src_file, r.call_line, r.src)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((r.src_file, r.call_line, r.src, cl, r.conf))
+    rows.sort(key=lambda x: (x[0], x[1]))
+    return rows[:limit]
+
+
+def find_impact(repo: Repo, name: str, max_depth: int = 3, limit: int = 200,
+                min_conf: str = "low", resolved=None):
+    """Transitive callers of NAME (the blast radius of changing it), over the
+    *resolved* call graph. BFS up the reverse graph to `max_depth`.
+
+    Returns (rows, files, test_files); rows are (rel, caller, call_line, depth).
+    """
+    resolved = resolve_edges(repo) if resolved is None else resolved
+    dlines = _def_line_map(repo)
+    floor = CONF_RANK.get(min_conf, 1)
+    # reverse graph: a resolved def-site -> its callers (as def-sites we can expand)
+    callers_of: "dict[tuple, list]" = {}
+    for r in resolved:
+        if not r.dst_file or CONF_RANK[r.conf] < floor:
+            continue
+        callers_of.setdefault((r.dst_file, r.dst_line), []).append(
+            (r.src_file, r.src, r.call_line))
+
+    visited, rows = set(), []
+    frontier = [(site, 0) for site in _def_sites(repo, name)]
+    seen_sites = set(frontier)
+    while frontier:
+        site, depth = frontier.pop(0)
+        if depth >= max_depth:
+            continue
+        for (sf, src, line) in callers_of.get(site, []):
+            key = (sf, src, line)
             if key in visited:
                 continue
             visited.add(key)
-            rows.append((rel, src or "(file scope)", line, depth + 1))
-            if src:
-                frontier.append((_last(src), depth + 1))
+            rows.append((sf, src, line, depth + 1))
+            caller_site = (sf, dlines.get((sf, src), 0))
+            if caller_site[1] and caller_site not in seen_sites:
+                seen_sites.add(caller_site)
+                frontier.append((caller_site, depth + 1))
     rows.sort(key=lambda r: (r[3], r[0], r[2]))
     rows = rows[:limit]
     files = sorted({r[0] for r in rows})
@@ -1877,11 +2252,12 @@ def format_callee_rows(rows) -> str:
     if not rows:
         return "(no callees — built without --edges, or none found)"
     out = []
-    for callee, dr, dl, call_line in rows:
+    for callee, dr, dl, call_line, conf in rows:
+        tag = "" if conf == "high" else f" [{conf}]"
         if dr:
-            out.append(f"{callee}  ->  {dr}:{dl}  (called at line {call_line})")
+            out.append(f"{callee}  ->  {dr}:{dl}  (line {call_line}){tag}")
         else:
-            out.append(f"{callee}  ->  (external/unresolved)  (called at line {call_line})")
+            out.append(f"{callee}  ->  (external)  (line {call_line})")
     return "\n".join(out)
 
 
@@ -1891,7 +2267,8 @@ def format_caller_rows(rows) -> str:
     return "\n".join(
         f"{rel}:{line}  in {caller}"
         + (f" (def {rel}:{cl})" if cl else "")
-        for rel, line, caller, cl in rows
+        + ("" if conf == "high" else f" [{conf}]")
+        for rel, line, caller, cl, conf in rows
     )
 
 
@@ -2182,6 +2559,13 @@ def main(argv=None) -> int:
     q.add_argument("--affected", nargs="?", const="", metavar="FILES",
                    help="print files/tests depending on FILES (comma-separated; "
                         "omit the value to use git's changed files)")
+    q.add_argument("--min-confidence", choices=["low", "medium", "high"],
+                   default="low", dest="min_confidence",
+                   help="drop resolved call edges below this confidence in "
+                        "callers/callees/impact (default: low = keep all)")
+    q.add_argument("--strict", action="store_true",
+                   help="shorthand for --min-confidence high (only confidently "
+                        "resolved call edges)")
     parser.add_argument(
         "--init", action="store_true",
         help="scaffold the committed-map workflow into REPO: write .repograph/, "
@@ -2245,14 +2629,15 @@ def main(argv=None) -> int:
         print(format_ref_rows(find_refs(repo.root, args.refs,
                                         definitions=def_locations(repo))))
         return 0
+    min_conf = "high" if args.strict else args.min_confidence
     if args.callers is not None:
-        print(format_caller_rows(find_callers(repo, args.callers)))
+        print(format_caller_rows(find_callers(repo, args.callers, min_conf=min_conf)))
         return 0
     if args.callees is not None:
-        print(format_callee_rows(find_callees(repo, args.callees)))
+        print(format_callee_rows(find_callees(repo, args.callees, min_conf=min_conf)))
         return 0
     if args.impact is not None:
-        print(format_impact_rows(find_impact(repo, args.impact)))
+        print(format_impact_rows(find_impact(repo, args.impact, min_conf=min_conf)))
         return 0
     if args.affected is not None:
         changed = ([c.strip() for c in args.affected.split(",") if c.strip()]

@@ -120,13 +120,22 @@ def tool_find_refs(args) -> str:
     return rg.format_ref_rows(rows)
 
 
+def _min_conf(args) -> str:
+    """Resolve a confidence floor from args: 'strict' wins, else min_confidence."""
+    if args.get("strict"):
+        return "high"
+    mc = args.get("min_confidence")
+    return mc if mc in ("low", "medium", "high") else "low"
+
+
 def tool_callers(args) -> str:
     name = (args.get("name") or "").strip()
     if not name:
         raise ValueError("'name' is required")
     repo = _build_for_query(args, edges=True)
     return rg.format_caller_rows(
-        rg.find_callers(repo, name, limit=int(args.get("limit", 100))))
+        rg.find_callers(repo, name, limit=int(args.get("limit", 100)),
+                        min_conf=_min_conf(args)))
 
 
 def tool_callees(args) -> str:
@@ -135,7 +144,8 @@ def tool_callees(args) -> str:
         raise ValueError("'name' is required")
     repo = _build_for_query(args, edges=True)
     return rg.format_callee_rows(
-        rg.find_callees(repo, name, limit=int(args.get("limit", 100))))
+        rg.find_callees(repo, name, limit=int(args.get("limit", 100)),
+                        min_conf=_min_conf(args)))
 
 
 def tool_impact(args) -> str:
@@ -144,7 +154,8 @@ def tool_impact(args) -> str:
         raise ValueError("'name' is required")
     repo = _build_for_query(args, edges=True)
     return rg.format_impact_rows(
-        rg.find_impact(repo, name, max_depth=int(args.get("max_depth", 3))))
+        rg.find_impact(repo, name, max_depth=int(args.get("max_depth", 3)),
+                       min_conf=_min_conf(args)))
 
 
 def tool_affected(args) -> str:
@@ -259,9 +270,10 @@ TOOLS = [
         "name": "callers",
         "description": (
             "Find call sites of a function/method NAME — 'who calls this'. "
-            "Returns `path:line  in <enclosing symbol>` rows. Built from a "
-            "heuristic call graph (name-based; precise with the tree-sitter "
-            "backend), so it's approximate — verify before relying on it."
+            "Returns `path:line  in <enclosing symbol>` rows, each tagged with a "
+            "confidence (high = resolved via self/super/import/local scope; "
+            "medium/low = name fallback). Set strict=true or min_confidence to "
+            "keep only confident edges; precise with tree_sitter."
         ),
         "inputSchema": {
             "type": "object",
@@ -269,6 +281,11 @@ TOOLS = [
                 "name": {"type": "string", "description": "function/method called"},
                 "path": {"type": "string", "description": "Repo dir (default: cwd)"},
                 "limit": {"type": "integer", "description": "max rows (default 100)"},
+                "min_confidence": {"type": "string",
+                                   "enum": ["low", "medium", "high"],
+                                   "description": "drop edges below this (default low)"},
+                "strict": {"type": "boolean",
+                           "description": "only high-confidence edges (= min_confidence high)"},
                 "tree_sitter": {"type": "boolean",
                                 "description": "use tree-sitter for precise edges"},
                 "no_ctags": {"type": "boolean"},
@@ -280,8 +297,9 @@ TOOLS = [
         "name": "callees",
         "description": (
             "List the symbols called from within NAME's body — 'what does this "
-            "call'. Returns `callee -> def path:line`, marking external/unresolved "
-            "callees. Heuristic call graph; precise with the tree-sitter backend."
+            "call'. Returns `callee -> def path:line` with a confidence tag, "
+            "marking external callees. strict/min_confidence filter; precise "
+            "with tree_sitter."
         ),
         "inputSchema": {
             "type": "object",
@@ -289,6 +307,9 @@ TOOLS = [
                 "name": {"type": "string", "description": "function/method to inspect"},
                 "path": {"type": "string", "description": "Repo dir (default: cwd)"},
                 "limit": {"type": "integer", "description": "max rows (default 100)"},
+                "min_confidence": {"type": "string",
+                                   "enum": ["low", "medium", "high"]},
+                "strict": {"type": "boolean"},
                 "tree_sitter": {"type": "boolean"},
                 "no_ctags": {"type": "boolean"},
             },
@@ -299,8 +320,9 @@ TOOLS = [
         "name": "impact",
         "description": (
             "Blast radius of changing NAME: its transitive callers (who breaks if "
-            "you change it), with affected test files called out. Returns a "
-            "depth-annotated list. Heuristic — confirm before acting on it."
+            "you change it) over the resolved call graph, with affected test files "
+            "called out. strict/min_confidence narrow it to confident edges; "
+            "precise with tree_sitter. Confirm before acting on it."
         ),
         "inputSchema": {
             "type": "object",
@@ -309,6 +331,9 @@ TOOLS = [
                 "path": {"type": "string", "description": "Repo dir (default: cwd)"},
                 "max_depth": {"type": "integer",
                               "description": "caller-graph depth (default 3)"},
+                "min_confidence": {"type": "string",
+                                   "enum": ["low", "medium", "high"]},
+                "strict": {"type": "boolean"},
                 "tree_sitter": {"type": "boolean"},
                 "no_ctags": {"type": "boolean"},
             },
