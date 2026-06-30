@@ -753,7 +753,8 @@ class EdgeExtractionTest(unittest.TestCase):
 
     def test_build_key_includes_edges(self):
         files = rg.files_from_dict(rg.repo_to_dict(self.repo))
-        self.assertEqual(files["core.py"].build_key, "defs:rx:1")
+        # edge tag is versioned ("e3" = edges carry receivers + import bindings)
+        self.assertEqual(files["core.py"].build_key, "defs:rx:e3")
 
     def test_edges_round_trip_json(self):
         files = rg.files_from_dict(rg.repo_to_dict(self.repo))
@@ -848,6 +849,194 @@ class TreeSitterBackendTest(unittest.TestCase):
         helper = next(s for s in syms if s.name == "helper")
         self.assertEqual(helper.line, 2)
         self.assertEqual(helper.end, 3)
+
+
+class EdgeResolutionTest(unittest.TestCase):
+    """resolve_edges + confidence on the regex backend (local + name fallback)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        for rel, content in EDGE_FIXTURE.items():
+            p = self.root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        self.repo = rg.build_repo(self.root, use_ctags=False, edges=True)
+        self.resolved = rg.resolve_edges(self.repo)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_local_free_call_high_confidence(self):
+        # main() calls helper() — a free call to a same-file def -> high/local.
+        hit = [r for r in self.resolved
+               if r.src == "main" and r.dst == "helper"]
+        self.assertTrue(hit)
+        self.assertEqual(hit[0].conf, "high")
+        self.assertEqual(hit[0].prov, "local")
+        self.assertEqual(hit[0].dst_file, "core.py")
+
+    def test_callees_carry_confidence(self):
+        rows = rg.find_callees(self.repo, "main")
+        # rows are (callee, dst_file, dst_line, call_line, conf)
+        helper = [r for r in rows if r[0] == "helper"][0]
+        self.assertEqual(helper[4], "high")
+
+    def test_import_resolves_cross_file(self):
+        # tests/test_core.py does `from core import main` then `main()` — the
+        # import binding resolves the call to core.py at high confidence.
+        hit = [r for r in self.resolved
+               if r.dst == "main" and r.src_file == "tests/test_core.py"]
+        self.assertTrue(hit)
+        self.assertEqual((hit[0].dst_file, hit[0].conf, hit[0].prov),
+                         ("core.py", "high", "import"))
+
+    def test_min_confidence_filters(self):
+        all_callers = rg.find_callers(self.repo, "helper", min_conf="low")
+        high_callers = rg.find_callers(self.repo, "helper", min_conf="high")
+        self.assertGreaterEqual(len(all_callers), len(high_callers))
+        self.assertTrue(all(r[4] == "high" for r in high_callers))
+
+    def test_resolved_edge_round_trips_recv(self):
+        # receiver survives the JSON cache round-trip
+        files = rg.files_from_dict(rg.repo_to_dict(self.repo))
+        recvs = {e.recv for e in files["core.py"].edges if e.kind == "calls"}
+        self.assertIn("self", recvs)  # self.run() in Widget.render
+
+
+@unittest.skipUnless(rg.tree_sitter_available(),
+                     "tree-sitter grammar pack not installed")
+class ResolutionHierarchyTest(unittest.TestCase):
+    """Precise self/super/inheritance resolution (needs qualified methods)."""
+
+    SRC = (
+        "class A:\n"
+        "    def run(self):\n"
+        "        return self.step()\n"
+        "    def step(self):\n"
+        "        return 1\n"
+        "\n"
+        "class B:\n"
+        "    def run(self):\n"
+        "        return self.step()\n"
+        "    def step(self):\n"
+        "        return 2\n"
+        "\n"
+        "class C(A):\n"
+        "    def go(self):\n"
+        "        return self.run()\n"
+    )
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "m.py").write_text(self.SRC, encoding="utf-8")
+        self.repo = rg.build_repo(self.root, use_tree_sitter=True, edges=True)
+        self.resolved = rg.resolve_edges(self.repo)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _edge(self, src):
+        return next(r for r in self.resolved if r.src == src)
+
+    def test_self_resolves_to_own_class_method(self):
+        # A.run -> A.step (line 4), NOT B.step (line 10)
+        a = self._edge("A.run")
+        self.assertEqual((a.dst_file, a.dst_line, a.conf, a.prov),
+                         ("m.py", 4, "high", "self"))
+        b = self._edge("B.run")
+        self.assertEqual(b.dst_line, 10)  # B.run -> B.step, disambiguated
+
+    def test_inherited_method_resolves_through_base(self):
+        # C(A).go calls self.run() -> A.run (line 2), inherited
+        c = self._edge("C.go")
+        self.assertEqual((c.dst_file, c.dst_line, c.conf), ("m.py", 2, "high"))
+
+    def test_callers_strict_disambiguates(self):
+        # callers of step at high confidence: A.run and B.run, each correct
+        rows = rg.find_callers(self.repo, "step", min_conf="high")
+        by_caller = {r[2]: r for r in rows}
+        self.assertIn("A.run", by_caller)
+        self.assertIn("B.run", by_caller)
+        self.assertTrue(all(r[4] == "high" for r in rows))
+
+    def test_impact_follows_inheritance(self):
+        rows, files, tests = rg.find_impact(self.repo, "run", min_conf="high")
+        callers = {r[1] for r in rows}
+        self.assertIn("C.go", callers)  # reaches the inherited caller
+
+
+class ImportResolutionTest(unittest.TestCase):
+    """Phase 2: import bindings → module→file resolution beats name fallback."""
+
+    PY_FILES = {
+        "pkg/util.py": "def helper():\n    return 1\n",
+        "app.py": "from pkg.util import helper\ndef run():\n    return helper()\n",
+        # decoy: a same-named def elsewhere — name-fallback would be ambiguous,
+        # import resolution must still pick pkg/util.py.
+        "decoy.py": "def helper():\n    return 99\n",
+    }
+    JS_FILES = {
+        "lib/math.js": "export function add(a, b) { return a + b; }\n",
+        "main.js": "import { add } from './lib/math';\n"
+                   "function compute() { return add(1, 2); }\n",
+    }
+
+    def _build(self, files):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        for rel, content in files.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        return rg.build_repo(root, use_ctags=False, edges=True)
+
+    def tearDown(self):
+        if hasattr(self, "_tmp"):
+            self._tmp.cleanup()
+
+    def test_python_import_binding_extracted(self):
+        repo = self._build(self.PY_FILES)
+        app = next(f for f in repo.files if f.rel_path == "app.py")
+        self.assertIn(("helper", "pkg.util"), app.import_bindings)
+
+    def test_python_call_resolves_through_import(self):
+        repo = self._build(self.PY_FILES)
+        hit = [r for r in rg.resolve_edges(repo)
+               if r.src == "run" and r.dst == "helper"][0]
+        self.assertEqual((hit.dst_file, hit.conf, hit.prov),
+                         ("pkg/util.py", "high", "import"))  # not decoy.py
+
+    def test_python_module_resolver(self):
+        fs = {"pkg/util.py", "pkg/__init__.py", "app.py"}
+        self.assertEqual(rg._resolve_py_module("app.py", "pkg.util", fs),
+                         "pkg/util.py")
+        # relative import climbs from the importer's package
+        self.assertEqual(
+            rg._resolve_py_module("pkg/app.py", ".util", {"pkg/util.py"}),
+            "pkg/util.py")
+
+    def test_js_import_binding_and_resolution(self):
+        repo = self._build(self.JS_FILES)
+        main = next(f for f in repo.files if f.rel_path == "main.js")
+        self.assertIn(("add", "./lib/math"), main.import_bindings)
+        hit = [r for r in rg.resolve_edges(repo) if r.dst == "add"][0]
+        self.assertEqual((hit.dst_file, hit.conf, hit.prov),
+                         ("lib/math.js", "high", "import"))
+
+    def test_js_module_resolver_extensions_and_index(self):
+        fs = {"lib/math.ts", "lib/widget/index.tsx", "main.ts"}
+        self.assertEqual(rg._resolve_js_module("main.ts", "./lib/math", fs),
+                         "lib/math.ts")
+        self.assertEqual(rg._resolve_js_module("main.ts", "./lib/widget", fs),
+                         "lib/widget/index.tsx")
+        self.assertIsNone(rg._resolve_js_module("main.ts", "react", fs))
+
+    def test_bindings_round_trip_json(self):
+        repo = self._build(self.PY_FILES)
+        files = rg.files_from_dict(rg.repo_to_dict(repo))
+        self.assertIn(("helper", "pkg.util"), files["app.py"].import_bindings)
 
 
 class WatchSignatureTest(unittest.TestCase):

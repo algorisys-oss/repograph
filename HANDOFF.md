@@ -184,6 +184,27 @@ adding deps; honest limits below.
    - **`--watch`**: stdlib mtime-poll incremental rebuild loop (`--interval`).
    - `build_key` is now `<level>:<backend>:<edges>` so switching backend or
      toggling edges re-analyzes only what's affected. 18 new tests; 69 pass.
+6. **Resolved edges + confidence (Phase 1+2) — DONE** (2026-06-30, branch
+   `feat/resolved-edges`): turns the name-based call graph into a *resolved* one.
+   - **Receiver capture**: `Edge` gains `recv` (self/this/super or a var); both
+     tree-sitter (`_ts_call_target`) and the regex `extract_calls` record it.
+   - **`resolve_edges(repo)`** — a separate in-memory pass (NOT cached, to keep
+     per-file edges incremental-correct) that binds each call to a concrete def
+     with a confidence: **high** = self/super/typed-receiver via the class
+     hierarchy (`class_registry` + `_lookup_method`), same-file local def, or an
+     **import**-resolved target; **medium** = unique global name; **low** =
+     ambiguous; *external* = not in repo.
+   - **Import resolution (Phase 2)**: `extract_import_bindings` records
+     `local_name → module` (Python `from … import …`; JS/TS `import {…}`/default/
+     namespace); `_resolve_py_module` / `_resolve_js_module` map a module string
+     to a repo file (relative levels, extension + index resolution). Persisted as
+     `ibind` under `--edges`; `build_key` edge tag bumped to `e3`.
+   - **Queries** (`find_callers/callees/impact`) now run on resolved edges and
+     take `min_conf`; CLI `--strict` / `--min-confidence`, mirrored as MCP
+     `strict`/`min_confidence`. Formatters print the level (`[medium]`).
+   - 15 new tests (33 total for edges/resolution); **84 pass** (8 ts-gated).
+   Still out (Phase 3/4, deliberately deferred): Go/Java import resolvers, and
+   receiver-variable type tracking (`x = Foo(); x.run()`).
    Still deliberately out (would break the zero-dep default): **embeddings** for
    *true* semantic search. CJS `module.exports` names in the regex path also
    still missing.

@@ -91,8 +91,9 @@ python repograph.py . --find build_repo        # where is a symbol defined?
 python repograph.py . --search "parse message" # rank symbols by name/doc words
 python repograph.py . --refs run_ctags         # where is a name used? (approx.)
 
-# Relationship / call-graph queries (auto-build the call graph; approximate):
+# Relationship / call-graph queries (auto-build a resolved call graph):
 python repograph.py . --callers build_repo     # who calls this?
+python repograph.py . --callers build_repo --strict   # high-confidence edges only
 python repograph.py . --callees cmd_init        # what does this call?
 python repograph.py . --impact analyze_bytes    # blast radius (transitive callers)
 python repograph.py . --affected repograph.py   # which files/tests depend on these?
@@ -262,13 +263,27 @@ you, but kept honest about being approximate:
 | `--impact NAME` | If I change `NAME`, what's the blast radius? (transitive callers, **affected tests flagged**) |
 | `--affected FILES` | Which files/tests depend on these changed files? (omit `FILES` to use git's changed set) |
 
-Edges are **name-based and resolved at query time**, never pre-bound — so a file's
-edges depend only on that file and the incremental cache stays correct. The
-tradeoff is the same one repograph is always honest about: a call to `run` matches
-*every* `run` definition, comments/strings can leak into the regex call finder,
-and there's no type resolution. It's a navigation aid, not ground truth — **verify
-before relying on it.** The tree-sitter backend (below) makes it much more precise
-by attributing calls to their exact enclosing scope from a real AST.
+Edges are stored **name-based and unresolved per file** (so the incremental cache
+stays correct — a file's edges depend only on that file), then **resolved at query
+time** against the whole repo, each with a **confidence level**:
+
+| Confidence | How it resolved |
+|------------|-----------------|
+| **high** | `self`/`super`/`this` → the method on the enclosing class **or its bases**; a receiver that's a known class; a free call to a **same-file** definition; or a call to a name **imported** from a file whose definition is found |
+| **medium** | global name match, and the name is defined **exactly once** in the repo |
+| **low** | global name match, but the name is **ambiguous** (defined in several places — best guess shown) |
+| *external* | no definition in the repo (library/builtin call) |
+
+So `self.run()` binds to *this* class's `run` (or the base it inherits from), and
+`helper()` imported from `./utils` binds to that file's `helper` — not every
+same-named symbol. Filter with **`--strict`** (high only) or
+**`--min-confidence {low,medium,high}`**; rows print their level (`[medium]`, `[low]`).
+
+Resolution quality scales with the backend: it's best on **tree-sitter** (exact
+receivers + enclosing scope from a real AST), good on **ctags** (qualified
+methods), and falls back to mostly medium/low on the pure-regex path. It's still a
+navigation aid, not a type-checked ground truth — there's no generics/overload
+resolution — but at **high** confidence it's reliable enough to act on.
 
 ## Backends: regex → ctags → tree-sitter
 
@@ -416,12 +431,16 @@ python repograph.py /path/to/ziglang/zig \
   catches top-level-ish definitions but misses JS/TS/Java methods and doesn't
   qualify names. Install universal-ctags to close that gap (see *Symbol
   extraction* above).
-- **Imports are always regex** and remain the weakest part. There *is* a call
-  graph now (`--edges` + the relationship queries), but on the default backends
-  it's **heuristic and name-based** — no type resolution, so it can't tell
-  `a.run()` from `b.run()`. The opt-in **tree-sitter** backend makes it precise
-  (exact enclosing scope) for the languages it covers; true semantic search via
-  embeddings is deliberately left out to keep the default zero-dependency.
+- **Call graph:** `--edges` + the relationship queries now build a **resolved**
+  call graph — `self`/`super` calls bind through the class hierarchy, and
+  imported names bind to their defining file (Python + JS/TS), each with a
+  **confidence** level (use `--strict` to keep only high). What remains
+  *unresolved* (medium/low confidence) is genuine ambiguity: no full type
+  inference, no generics/overload resolution, and receiver-variable type tracking
+  (`x = Foo(); x.run()`) isn't done yet. Quality is best on the tree-sitter
+  backend. Treat low-confidence edges as hints; high-confidence ones are reliable.
+- True **semantic** search (embeddings) is deliberately left out to keep the
+  default zero-dependency; compose with an external index if you need it.
 
 ## License
 

@@ -109,10 +109,11 @@ index); `--symbols none` drops symbols entirely. Imports/docs are always regex.
 - Without universal-ctags, the regex fallback catches only top-level-ish defs —
   class/object **methods are missed** for JS/TS/Java. Installing
   universal-ctags closes this.
-- Imports/relationships are the weakest layer. The call graph (`--edges` and the
-  `--callers`/`--callees`/`--impact`/`--affected` queries) is heuristic and
-  name-based — no type resolution, so it's a navigation aid to verify, not ground
-  truth. The tree-sitter backend makes it much more precise.
+- The call graph (`--edges` and the `--callers`/`--callees`/`--impact`/
+  `--affected` queries) is **resolved with a confidence level** — `self`/`super`
+  and imported calls bind precisely (high); ambiguous global name-matches are
+  medium/low. Trust **high** (use `--strict`); treat low as a hint. There's no
+  full type inference. Best with `--tree-sitter`.
 - Treat the index as a high-recall router, not ground truth: if a symbol isn't
   listed, fall back to a scoped grep in the file the index points you to.
 
@@ -135,12 +136,16 @@ python3 "$REPOGRAPH_PY" . --refs handleClick        # where a name is USED (appr
 
 ## Relationship / call-graph queries
 
-These build a call graph (`--edges` turns on automatically) so you can reason
-about *connections*, not just locations. Approximate — name-based, so verify
-before relying on them; far more precise with the tree-sitter backend below.
+These build a **resolved** call graph (`--edges` turns on automatically) so you
+can reason about *connections*, not just locations. Each edge carries a
+**confidence**: `self`/`super` calls bind through the class hierarchy, imported
+names bind to their defining file — those are *high*; an ambiguous global
+name-match is *medium*/*low*. Rows show the level (`[medium]`); pass `--strict`
+(or `--min-confidence high`) to keep only edges you can trust.
 
 ```bash
-python3 "$REPOGRAPH_PY" . --callers build_repo    # who calls this?
+python3 "$REPOGRAPH_PY" . --callers build_repo            # who calls this?
+python3 "$REPOGRAPH_PY" . --callers build_repo --strict   # high-confidence only
 python3 "$REPOGRAPH_PY" . --callees cmd_init       # what does this call?
 python3 "$REPOGRAPH_PY" . --impact analyze_bytes   # blast radius + affected tests
 python3 "$REPOGRAPH_PY" . --affected src/app.py    # files/tests depending on these
@@ -148,8 +153,10 @@ python3 "$REPOGRAPH_PY" . --affected               # …using git's changed file
 ```
 
 - `--impact` is ideal before a risky change: it lists the transitive callers and
-  flags which **test files** are affected.
+  flags which **test files** are affected. Add `--strict` to trust the result.
 - `--affected` with no args reads git's changed files — a quick "what to re-test".
+- Resolution is best with `--tree-sitter` (exact receivers + scope); on the plain
+  regex backend most edges land at medium/low confidence.
 
 ## Precise backend (optional tree-sitter)
 
