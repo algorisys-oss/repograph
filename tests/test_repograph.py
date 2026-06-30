@@ -753,8 +753,8 @@ class EdgeExtractionTest(unittest.TestCase):
 
     def test_build_key_includes_edges(self):
         files = rg.files_from_dict(rg.repo_to_dict(self.repo))
-        # edge tag is versioned ("e3" = edges carry receivers + import bindings)
-        self.assertEqual(files["core.py"].build_key, "defs:rx:e3")
+        # edge tag is versioned ("e4" = receivers + import bindings + var types)
+        self.assertEqual(files["core.py"].build_key, "defs:rx:e4")
 
     def test_edges_round_trip_json(self):
         files = rg.files_from_dict(rg.repo_to_dict(self.repo))
@@ -1132,6 +1132,95 @@ class JavaResolutionTreeSitterTest(unittest.TestCase):
         repo = rg.build_repo(root, use_tree_sitter=True, edges=True)
         hit = [r for r in rg.resolve_edges(repo) if r.dst == "helper"][0]
         self.assertEqual((hit.dst_file, hit.conf), ("com/lib/Util.java", "high"))
+        self._tmp.cleanup()
+
+
+class VarTypeTest(unittest.TestCase):
+    """Phase 4: local `var = Type()` tracking and `x.method()` resolution."""
+
+    def _build(self, files, **kw):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        for rel, content in files.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        return rg.build_repo(root, use_ctags=False, edges=True, **kw)
+
+    def tearDown(self):
+        if hasattr(self, "_tmp"):
+            self._tmp.cleanup()
+
+    def test_extract_python_constructor(self):
+        syms = [rg.Symbol("run", "function", 1)]
+        lines = ["def run():", "    e = Engine()", "    return e.start()"]
+        vt = rg.extract_var_types(lines, "python", syms)
+        self.assertIn(("run", "e", "Engine", 2), vt)
+
+    def test_extract_python_annotation(self):
+        vt = rg.extract_var_types(["x: Widget = make()"], "python",
+                                  [rg.Symbol("f", "function", 0)])
+        self.assertTrue(any(v[1:3] == ("x", "Widget") for v in vt))
+
+    def test_extract_js_new(self):
+        vt = rg.extract_var_types(["const c = new Client();"], "javascript",
+                                  [rg.Symbol("f", "function", 0)])
+        self.assertTrue(any(v[1:3] == ("c", "Client") for v in vt))
+
+    def test_extract_java_declaration(self):
+        vt = rg.extract_var_types(["Service s = new Service();"], "java",
+                                  [rg.Symbol("m", "method", 0)])
+        self.assertTrue(any(v[1:3] == ("s", "Service") for v in vt))
+
+    def test_extract_go_composite_and_factory(self):
+        syms = [rg.Symbol("run", "function", 0)]
+        self.assertTrue(any(v[1:3] == ("e", "Engine") for v in
+                            rg.extract_var_types(["e := Engine{}"], "go", syms)))
+        self.assertTrue(any(v[1:3] == ("c", "Client") for v in
+                            rg.extract_var_types(["c := NewClient()"], "go", syms)))
+
+    def test_var_types_extracted_regex_backend(self):
+        repo = self._build({"m.py":
+            "class Engine:\n    def start(self):\n        return 1\n"
+            "def run():\n    e = Engine()\n    return e.start()\n"})
+        m = next(f for f in repo.files if f.rel_path == "m.py")
+        self.assertIn(("run", "e", "Engine", 5), m.var_types)
+
+    def test_var_types_round_trip_json(self):
+        repo = self._build({"m.py":
+            "def run():\n    e = Engine()\n    return e\n"})
+        files = rg.files_from_dict(rg.repo_to_dict(repo))
+        self.assertTrue(files["m.py"].var_types)
+
+
+@unittest.skipUnless(rg.tree_sitter_available(),
+                     "tree-sitter grammar pack not installed")
+class VarTypeResolutionTreeSitterTest(unittest.TestCase):
+    """`x = Foo(); x.m()` resolves to Foo.m, disambiguated from same-named methods."""
+
+    SRC = (
+        "class Engine:\n"
+        "    def start(self):\n"
+        "        return 1\n"
+        "\n"
+        "class Other:\n"
+        "    def start(self):\n"
+        "        return 2\n"
+        "\n"
+        "def run():\n"
+        "    e = Engine()\n"
+        "    return e.start()\n"
+    )
+
+    def test_var_type_resolves_to_assigned_class(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        (root / "m.py").write_text(self.SRC, encoding="utf-8")
+        repo = rg.build_repo(root, use_tree_sitter=True, edges=True)
+        hit = [r for r in rg.resolve_edges(repo) if r.dst == "start"][0]
+        # Engine.start is at line 2, Other.start at line 6 — must pick Engine's.
+        self.assertEqual((hit.dst_file, hit.dst_line, hit.conf, hit.prov),
+                         ("m.py", 2, "high", "var-type"))
         self._tmp.cleanup()
 
 

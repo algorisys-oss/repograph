@@ -216,8 +216,22 @@ adding deps; honest limits below.
      disambiguates same-named classes. Go resolves on any backend (top-level funcs
      are regex-visible); Java needs ctags/tree-sitter (regex misses methods).
    - 8 new tests; **92 pass** (9 ts-gated).
-   Still out (Phase 4, deliberately deferred): receiver-variable type tracking
-   (`x = Foo(); x.run()`).
+8. **Receiver-variable type tracking (Phase 4) — DONE** (2026-06-30, branch
+   `feat/var-type-resolution`): resolves instance-method calls `x.run()` when
+   `x`'s type is known from a constructor-style assignment in the same function.
+   - `extract_var_types` (regex, all backends) records `(enclosing, var, type,
+     line)` from `x = Foo()` (Py), `new Foo()` (JS/TS/Java), `Foo{}` / `NewFoo()`
+     / `var x Foo` (Go); only capitalized RHS types (class-name convention).
+     Persisted as `vtypes` under `--edges`; `build_key` edge tag → `e4`.
+   - resolve_edges Tier 1e: a receiver var with a tracked type → `_lookup_method`
+     on that class hierarchy; high when the var's type is unambiguous in scope,
+     medium when several types were assigned. Coarse (per-function) scoping; the
+     method lookup needs qualified methods so it's ctags/tree-sitter-effective.
+   - 8 new tests; **100 pass** (10 ts-gated).
+   The resolution ladder is now: self/super → import (recv) → known class →
+   var-type → free-call local/import → name fallback. Remaining (deliberately
+   out): full type inference (factory returns, reassignment, generics/overloads),
+   framework dynamic-dispatch synthesis, and embeddings for semantic search.
    Still deliberately out (would break the zero-dep default): **embeddings** for
    *true* semantic search. CJS `module.exports` names in the regex path also
    still missing.

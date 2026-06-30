@@ -269,7 +269,7 @@ time** against the whole repo, each with a **confidence level**:
 
 | Confidence | How it resolved |
 |------------|-----------------|
-| **high** | `self`/`super`/`this` → the method on the enclosing class **or its bases**; a receiver that's a known class; a free call to a **same-file** definition; or an **imported** call resolved to its defining file — a free import (Python/JS-TS `helper()`) or a package/class-qualified one (Go `util.Func()`, Java `Util.method()`) |
+| **high** | `self`/`super`/`this` → the method on the enclosing class **or its bases**; a receiver that's a known class; a receiver **variable** whose type is known from a `x = Foo()` assignment in scope; a free call to a **same-file** definition; or an **imported** call resolved to its defining file — a free import (Python/JS-TS `helper()`) or a package/class-qualified one (Go `util.Func()`, Java `Util.method()`) |
 | **medium** | global name match, and the name is defined **exactly once** in the repo |
 | **low** | global name match, but the name is **ambiguous** (defined in several places — best guess shown) |
 | *external* | no definition in the repo (library/builtin call) |
@@ -437,11 +437,12 @@ python repograph.py /path/to/ziglang/zig \
   call graph — `self`/`super` calls bind through the class hierarchy, and imported
   calls bind to their defining file (Python & JS/TS free imports, Go package
   imports, Java class imports), each with a **confidence** level (use `--strict`
-  to keep only high). What remains *unresolved* (medium/low confidence) is genuine
-  ambiguity: no full type inference, no generics/overload resolution, and
-  receiver-variable type tracking (`x = Foo(); x.run()`) isn't done yet. Quality is
-  best on the tree-sitter backend. Treat low-confidence edges as hints;
-  high-confidence ones are reliable.
+  to keep only high). Receiver variables are tracked through simple
+  `x = Foo()` / `new Foo()` / `Foo{}` assignments so `x.run()` binds to `Foo.run`.
+  What remains *unresolved* (medium/low confidence) is genuine ambiguity: no full
+  type inference (factory returns, reassignment, generics/overloads), and no
+  framework dynamic-dispatch synthesis. Quality is best on the tree-sitter backend.
+  Treat low-confidence edges as hints; high-confidence ones are reliable.
 - True **semantic** search (embeddings) is deliberately left out to keep the
   default zero-dependency; compose with an external index if you need it.
 
