@@ -44,10 +44,12 @@ place to touch when adding/improving a language.
   was Python vs Zig vs shell+ctags.
 - **Claude writes this tool** (unlike the learning project where the human writes
   every line) — it's a utility, not a lesson.
-- **Language-agnostic + shallow (regex)** — chosen over tree-sitter/ctags to keep
-  zero-dependency and work on any repo. Accepted cost: approximate symbols, and
-  imports/relationships are the weakest layer. ctags/tree-sitter is the
-  documented accuracy upgrade path if/when needed.
+- **Language-agnostic + shallow (regex) by default** — chosen to keep the
+  *default* zero-dependency and working on any repo. Accepted cost: approximate
+  symbols, and imports/relationships are the weakest layer. The accuracy upgrade
+  path is now built as **optional, opt-in backends** (see entry 5 below):
+  universal-ctags (auto) and tree-sitter (`--tree-sitter`); the regex floor and
+  zero-dep default are unchanged.
 - **Content-hash change detection** (not mtime/size) — robust to fresh clones and
   touches. Cost: every file is still read each run to hash it, so warm runs save
   *parsing*, not *I/O* (modest speedup; always correct).
@@ -135,11 +137,13 @@ adding deps; honest limits below.
   doesn't qualify names (install ctags to fix). CJS `module.exports = {…}` names
   still aren't pulled out by the regex path.
 - `.vue/.svelte/.heex/.eex` templates get a file node but no symbols.
-- Imports are always regex (weakest layer). No type resolution, no *resolved*
-  call graph — `find_refs` gives **lexical** usages (name-based, can't tell
-  `a.connect()` from `b.connect()`); `search` gives **lexical** by-intent
-  (word/doc overlap, not semantic). tree-sitter (resolved refs) / embeddings
-  (true semantic) are the next steps, deliberately left out to keep zero-dep.
+- Imports are always regex (weakest layer). There is now a **call graph**
+  (`--edges` + `--callers`/`--callees`/`--impact`/`--affected`), but it's
+  **heuristic and name-based** unless the tree-sitter backend is on: it can't
+  tell `a.connect()` from `b.connect()` and there's still no type resolution.
+  `find_refs`/`search` remain lexical. The `--tree-sitter` backend makes the call
+  graph precise (exact enclosing scope); **embeddings** (true semantic) remain
+  deliberately out to keep the default zero-dep.
 
 ## Open threads / next steps
 
@@ -162,11 +166,27 @@ adding deps; honest limits below.
    axes (map vs. search) — keep both; no reason to fold one into the other.
 4. **Accuracy upgrades — ctags + git fast path + query layer DONE** (2026-06-04):
    universal-ctags backend (qualified methods); git-status fast path; lexical
-   `find_symbol`/`search`/`find_refs`. Still open if needed: a **tree-sitter**
-   backend for *resolved* refs/call-graph/types, and **embeddings** for *true*
-   semantic search (both deliberately deferred — they'd break zero-dep; the plan
-   is to compose with an LSP / embedding index rather than rebuild them). CJS
-   `module.exports` names in the regex path also still missing.
+   `find_symbol`/`search`/`find_refs`.
+5. **Relationship edges + tree-sitter backend + call-graph queries + watch —
+   DONE** (2026-06-30, branch `feat/semantic-edges-tree-sitter`, merged to `dev`):
+   - **`--edges`**: per-file `calls` (span-attributed to the nearest enclosing
+     def), `extends`, `implements`; edges stay name-based/unresolved so the
+     incremental cache stays per-file-correct. `Symbol` gains an `end` span;
+     ctags now reads end lines too (`--fields +e`).
+   - **Call-graph queries**: `--callers`, `--callees`, `--impact` (transitive
+     callers + flagged affected tests), `--affected` (files/tests depending on a
+     changed set; git's changed files when no arg). Mirrored as MCP tools.
+   - **`--tree-sitter`** (opt-in, needs the `tree-sitter-language-pack` wheel):
+     real ASTs for Python/JS/TS/Go/Rust/Java/Ruby/C → precise qualified symbols,
+     exact spans, and call edges bound to the exact enclosing scope. Backend
+     precedence tree-sitter > ctags > regex; binding-agnostic shim handles both
+     property- and method-style tree-sitter wheels; falls back cleanly if absent.
+   - **`--watch`**: stdlib mtime-poll incremental rebuild loop (`--interval`).
+   - `build_key` is now `<level>:<backend>:<edges>` so switching backend or
+     toggling edges re-analyzes only what's affected. 18 new tests; 69 pass.
+   Still deliberately out (would break the zero-dep default): **embeddings** for
+   *true* semantic search. CJS `module.exports` names in the regex path also
+   still missing.
 
 ## Pointers
 

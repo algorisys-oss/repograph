@@ -416,10 +416,12 @@ python repograph.py /path/to/ziglang/zig \
   catches top-level-ish definitions but misses JS/TS/Java methods and doesn't
   qualify names. Install universal-ctags to close that gap (see *Symbol
   extraction* above).
-- **Imports/relationships are always regex** and remain the weakest part — and
-  there's still no call graph or type resolution (a much harder, research-grade
-  problem). tree-sitter grammars would be the next step there, at the cost of
-  the zero-dependency simplicity.
+- **Imports are always regex** and remain the weakest part. There *is* a call
+  graph now (`--edges` + the relationship queries), but on the default backends
+  it's **heuristic and name-based** — no type resolution, so it can't tell
+  `a.run()` from `b.run()`. The opt-in **tree-sitter** backend makes it precise
+  (exact enclosing scope) for the languages it covers; true semantic search via
+  embeddings is deliberately left out to keep the default zero-dependency.
 
 ## License
 
