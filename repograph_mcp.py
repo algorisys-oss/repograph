@@ -2,15 +2,19 @@
 """repograph MCP server — expose repograph as MCP tools for any MCP client.
 
 A thin, zero-dependency (stdlib-only) Model Context Protocol server over stdio.
-It imports repograph in-process (no subprocess) and exposes two tools:
+It imports repograph in-process (no subprocess) and exposes these tools:
 
-  - repo_index(path?, include?, exclude?, symbols?, no_ctags?, rebuild?)
-        Build/refresh the repo map and return the terse one-line-per-file index
-        (path | lang | lines | symbols). Uses an incremental per-repo cache so
-        repeat calls are fast.
-  - find_symbol(query, path?, kind?, limit?)
-        Find where a symbol is defined; returns `path:line  kind  name` rows so
-        the agent can open exactly the right spot instead of grepping.
+  - repo_index   — build/refresh the map; return the terse one-line-per-file index
+  - find_symbol  — where a symbol is defined (`path:line  kind  name`)
+  - search       — lexical "by intent" ranking over names + docs
+  - find_refs    — lexical usages of an identifier (git grep)
+  - callers      — call sites of a function/method (heuristic call graph)
+  - callees      — what a function/method calls
+  - impact       — transitive callers (blast radius), tests flagged
+  - affected     — files/tests depending on a set of changed files
+
+All use an incremental per-repo cache so repeat calls are fast. The call-graph
+tools (callers/callees/impact/affected) build with relationship edges enabled.
 
 Transport: newline-delimited JSON-RPC 2.0 on stdin/stdout (the MCP stdio
 convention). No third-party packages — runs anywhere `python3` does.
@@ -40,22 +44,27 @@ CACHE_DIR = Path.home() / ".claude" / "repograph-cache"
 # Core: build (incrementally) and query a repo.
 # --------------------------------------------------------------------------- #
 
-def _cache_path(repo: Path) -> Path:
+def _cache_path(repo: Path, edges: bool = False) -> Path:
     slug = str(repo.resolve()).replace(os.sep, "_").lstrip("_")
-    return CACHE_DIR / f"{slug}.json"
+    # Edge-enabled builds use a distinct cache so they don't thrash the
+    # edge-free index cache (the two carry different build_key profiles).
+    suffix = ".edges.json" if edges else ".json"
+    return CACHE_DIR / f"{slug}{suffix}"
 
 
-def _build(path, include, exclude, symbols, no_ctags, rebuild):
+def _build(path, include, exclude, symbols, no_ctags, rebuild,
+           tree_sitter=False, edges=False):
     repo_dir = Path(path or os.getcwd()).expanduser()
     if not repo_dir.is_dir():
         raise ValueError(f"not a directory: {repo_dir}")
-    cache_file = _cache_path(repo_dir)
+    cache_file = _cache_path(repo_dir, edges)
     cache = {}
     if cache_file.exists() and not rebuild:
         cache = rg.load_cache(cache_file)
     repo = rg.build_repo(
         repo_dir, include=include or None, exclude=exclude or None, cache=cache,
         use_ctags=not no_ctags, symbols_level=symbols or "defs",
+        use_tree_sitter=tree_sitter, edges=edges,
     )
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_file.write_text(rg.render_json(repo), encoding="utf-8")
@@ -66,17 +75,19 @@ def tool_repo_index(args) -> str:
     repo = _build(
         args.get("path"), args.get("include"), args.get("exclude"),
         args.get("symbols", "defs"), bool(args.get("no_ctags")),
-        bool(args.get("rebuild")),
+        bool(args.get("rebuild")), tree_sitter=bool(args.get("tree_sitter")),
+        edges=bool(args.get("edges")),
     )
     stats = (f"{len(repo.files)} files, {repo.analyzed} analyzed, "
              f"{repo.reused} reused this run")
     return f"# {stats}\n\n" + rg.render_index(repo)
 
 
-def _build_for_query(args):
+def _build_for_query(args, edges=False):
     return _build(
         args.get("path"), args.get("include"), args.get("exclude"),
         args.get("symbols", "defs"), bool(args.get("no_ctags")), False,
+        tree_sitter=bool(args.get("tree_sitter")), edges=edges,
     )
 
 
@@ -107,6 +118,45 @@ def tool_find_refs(args) -> str:
     rows = rg.find_refs(repo.root, name, limit=int(args.get("limit", 80)),
                         definitions=rg.def_locations(repo))
     return rg.format_ref_rows(rows)
+
+
+def tool_callers(args) -> str:
+    name = (args.get("name") or "").strip()
+    if not name:
+        raise ValueError("'name' is required")
+    repo = _build_for_query(args, edges=True)
+    return rg.format_caller_rows(
+        rg.find_callers(repo, name, limit=int(args.get("limit", 100))))
+
+
+def tool_callees(args) -> str:
+    name = (args.get("name") or "").strip()
+    if not name:
+        raise ValueError("'name' is required")
+    repo = _build_for_query(args, edges=True)
+    return rg.format_callee_rows(
+        rg.find_callees(repo, name, limit=int(args.get("limit", 100))))
+
+
+def tool_impact(args) -> str:
+    name = (args.get("name") or "").strip()
+    if not name:
+        raise ValueError("'name' is required")
+    repo = _build_for_query(args, edges=True)
+    return rg.format_impact_rows(
+        rg.find_impact(repo, name, max_depth=int(args.get("max_depth", 3))))
+
+
+def tool_affected(args) -> str:
+    repo = _build_for_query(args, edges=True)
+    files = args.get("files")
+    if isinstance(files, str):
+        changed = [c.strip() for c in files.split(",") if c.strip()]
+    elif isinstance(files, list):
+        changed = [str(c) for c in files]
+    else:
+        changed = rg.git_changed_files(repo.root)
+    return rg.format_affected_rows(rg.find_affected(repo, changed))
 
 
 TOOLS = [
@@ -205,6 +255,84 @@ TOOLS = [
             "required": ["name"],
         },
     },
+    {
+        "name": "callers",
+        "description": (
+            "Find call sites of a function/method NAME — 'who calls this'. "
+            "Returns `path:line  in <enclosing symbol>` rows. Built from a "
+            "heuristic call graph (name-based; precise with the tree-sitter "
+            "backend), so it's approximate — verify before relying on it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "function/method called"},
+                "path": {"type": "string", "description": "Repo dir (default: cwd)"},
+                "limit": {"type": "integer", "description": "max rows (default 100)"},
+                "tree_sitter": {"type": "boolean",
+                                "description": "use tree-sitter for precise edges"},
+                "no_ctags": {"type": "boolean"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "callees",
+        "description": (
+            "List the symbols called from within NAME's body — 'what does this "
+            "call'. Returns `callee -> def path:line`, marking external/unresolved "
+            "callees. Heuristic call graph; precise with the tree-sitter backend."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "function/method to inspect"},
+                "path": {"type": "string", "description": "Repo dir (default: cwd)"},
+                "limit": {"type": "integer", "description": "max rows (default 100)"},
+                "tree_sitter": {"type": "boolean"},
+                "no_ctags": {"type": "boolean"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "impact",
+        "description": (
+            "Blast radius of changing NAME: its transitive callers (who breaks if "
+            "you change it), with affected test files called out. Returns a "
+            "depth-annotated list. Heuristic — confirm before acting on it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "symbol to assess"},
+                "path": {"type": "string", "description": "Repo dir (default: cwd)"},
+                "max_depth": {"type": "integer",
+                              "description": "caller-graph depth (default 3)"},
+                "tree_sitter": {"type": "boolean"},
+                "no_ctags": {"type": "boolean"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "affected",
+        "description": (
+            "Given changed files, list the files (tests first) that depend on "
+            "them — the test set to run after an edit. Resolves dependencies from "
+            "imports + the call graph. Omit 'files' to use git's changed files."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "files": {"description": "changed paths: array or comma-separated "
+                          "string; omit to use git status"},
+                "path": {"type": "string", "description": "Repo dir (default: cwd)"},
+                "tree_sitter": {"type": "boolean"},
+                "no_ctags": {"type": "boolean"},
+            },
+        },
+    },
 ]
 
 DISPATCH = {
@@ -212,6 +340,10 @@ DISPATCH = {
     "find_symbol": tool_find_symbol,
     "search": tool_search,
     "find_refs": tool_find_refs,
+    "callers": tool_callers,
+    "callees": tool_callees,
+    "impact": tool_impact,
+    "affected": tool_affected,
 }
 
 
