@@ -357,6 +357,7 @@ class FileNode:
     imports: list = field(default_factory=list)   # list[str]
     edges: list = field(default_factory=list)     # list[Edge]
     import_bindings: list = field(default_factory=list)  # list[(local_name, module)]
+    var_types: list = field(default_factory=list)  # list[(enclosing, var, type, line)]
 
 
 @dataclass
@@ -622,6 +623,71 @@ def _go_bind(out, alias, path):
     local = alias or path.rsplit("/", 1)[-1]  # default: last path element
     if re.fullmatch(r"\w+", local or ""):
         out.append((local, path))
+
+
+# Local-variable type assignments, per language: (regex, var_group, type_groups).
+# `type_groups` is tried in order; the first non-None capture is the type (so an
+# explicit annotation/declaration wins over the constructed value). Only
+# capitalized RHS types are kept — the near-universal class-name convention —
+# which is what makes `x = Foo()` / `new Foo()` / `Foo{}` distinguishable from a
+# plain function call. Receiver-type tracking for `x.method()` (Phase 4).
+_VARTYPE = {
+    "python": [
+        (_c(r"^\s*(\w+)\s*:\s*([A-Z]\w*)\s*="), 1, (2,)),     # x: Foo = ...
+        (_c(r"^\s*(\w+)\s*=\s*([A-Z]\w*)\s*\("), 1, (2,)),    # x = Foo(...)
+    ],
+    "javascript": [
+        (_c(r"\b(?:const|let|var)\s+(\w+)\s*:\s*([A-Z]\w*)"), 1, (2,)),
+        (_c(r"\b(?:const|let|var)\s+(\w+)\s*=\s*new\s+([A-Z]\w*)"), 1, (2,)),
+    ],
+    "java": [
+        (_c(r"\b([A-Z]\w*)\s+(\w+)\s*=\s*new\s+[A-Z]\w*"), 2, (1,)),  # Foo x = new Foo()
+        (_c(r"\bvar\s+(\w+)\s*=\s*new\s+([A-Z]\w*)"), 1, (2,)),       # var x = new Foo()
+    ],
+    "go": [
+        (_c(r"\b(\w+)\s*:=\s*&?([A-Z]\w*)\s*\{"), 1, (2,)),   # x := Foo{} / &Foo{}
+        (_c(r"\b(\w+)\s*:=\s*New([A-Z]\w*)\s*\("), 1, (2,)),  # x := NewFoo(...)
+        (_c(r"\bvar\s+(\w+)\s+([A-Z]\w*)\b"), 1, (2,)),       # var x Foo
+    ],
+}
+_VARTYPE["typescript"] = _VARTYPE["javascript"]
+
+
+def extract_var_types(lines, language: str, symbols) -> "list[tuple]":
+    """Track local `var -> Type` from constructor-style assignments, attributed to
+    the enclosing definition: [(enclosing, var, type, line)].
+
+    Lets the resolver bind `x.method()` when `x = Foo()` is in scope. Heuristic:
+    relies on the capitalized-class-name convention and coarse (per-function)
+    scoping. Other languages → [].
+    """
+    pats = _VARTYPE.get(language)
+    if not pats:
+        return []
+    sorted_syms = sorted(symbols, key=lambda s: s.line)
+    n = len(sorted_syms)
+    si = 0
+    cur = ""  # enclosing symbol; "" = file scope
+    out: "list[tuple]" = []
+    seen: "set[tuple]" = set()
+    for i, line in enumerate(lines, start=1):
+        while si < n and sorted_syms[si].line <= i:
+            cur = sorted_syms[si].name
+            si += 1
+        for pat, vg, tgs in pats:
+            m = pat.search(line)
+            if not m:
+                continue
+            var = m.group(vg)
+            typ = next((m.group(g) for g in tgs if m.group(g)), None)
+            if (var and typ and re.fullmatch(r"\w+", var)
+                    and re.fullmatch(r"[A-Z]\w*", typ)):
+                key = (cur, var, typ)
+                if key not in seen:
+                    seen.add(key)
+                    out.append((cur, var, typ, i))
+            break
+    return out
 
 
 def assign_spans(symbols, total_lines: int) -> None:
@@ -1245,6 +1311,7 @@ def analyze_bytes(rel: str, ext: str, data: bytes, digest: str,
                 edges.extend(extract_calls(lines, node.symbols))
             node.edges = edges
             node.import_bindings = extract_import_bindings(lines, language)
+            node.var_types = extract_var_types(lines, language, node.symbols)
     return node
 
 
@@ -1362,9 +1429,9 @@ def build_repo(root: Path, include=None, exclude=None, cache=None,
     ctags_effective = (not ts_effective and use_ctags
                        and symbols_level != "none" and ctags_available())
     backend = "ts" if ts_effective else ("ct" if ctags_effective else "rx")
-    # Edge tag is versioned ("e3" = edges carry call receivers + import bindings)
-    # so that bumping the edge schema invalidates only edge-enabled cache entries.
-    want_key = f"{symbols_level}:{backend}:{'e3' if edges else '0'}"
+    # Edge tag is versioned ("e4" = + receivers, import bindings, var types) so
+    # that bumping the edge schema invalidates only edge-enabled cache entries.
+    want_key = f"{symbols_level}:{backend}:{'e4' if edges else '0'}"
 
     # Phase A — select, detect changes, reuse from cache. Defer analysis of
     # changed files so ctags can run over them in a single batch (Phase B).
@@ -1478,6 +1545,8 @@ def repo_to_dict(repo: Repo) -> dict:
             d["edges"] = [edge_dict(e) for e in f.edges]
         if f.import_bindings:  # [(local, module)] — present only with --edges
             d["ibind"] = [[n, m] for (n, m) in f.import_bindings]
+        if f.var_types:  # [(enclosing, var, type, line)] — present only with --edges
+            d["vtypes"] = [[e, v, t, ln] for (e, v, t, ln) in f.var_types]
         if f.gitsha:  # omit when absent (non-git) to keep the artifact lean
             d["gitsha"] = f.gitsha
         if f.build_key:
@@ -1514,6 +1583,7 @@ def files_from_dict(d: dict) -> "dict[str, FileNode]":
                 for e in fd.get("edges", [])
             ],
             import_bindings=[tuple(b) for b in fd.get("ibind", [])],
+            var_types=[tuple(v) for v in fd.get("vtypes", [])],
         )
         out[node.rel_path] = node
     return out
@@ -2070,6 +2140,11 @@ def resolve_edges(repo: Repo) -> "list[ResolvedEdge]":
             glob.setdefault(bare, []).append((f.rel_path, s.line))
         d = f.rel_path.rsplit("/", 1)[0] if "/" in f.rel_path else ""
         dir_files.setdefault(d, []).append(f.rel_path)
+    # (file, enclosing, var) -> set of types from local assignments
+    vartypes: dict = {}
+    for f in repo.files:
+        for (enclosing, var, typ, _ln) in f.var_types:
+            vartypes.setdefault((f.rel_path, enclosing, var), set()).add(typ)
 
     def via_import(rf, name, dst):
         """Resolve `dst` through the file's import binding of `name` (the local
@@ -2122,6 +2197,19 @@ def resolve_edges(repo: Repo) -> "list[ResolvedEdge]":
                 target = _lookup_method(classes, e.recv, e.dst)
                 if target:
                     r.conf, r.prov = "high", "type"
+            # Tier 1e — receiver is a local variable with a tracked type
+            # (`x = Foo(); x.run()`): resolve the method on that type. High when
+            # the variable's type is unambiguous in scope, else medium.
+            if target is None and e.recv:
+                types = vartypes.get((rf, e.src, e.recv))
+                if types:
+                    for t in sorted(types):
+                        hit = _lookup_method(classes, t, e.dst)
+                        if hit:
+                            target = hit
+                            r.conf = "high" if len(types) == 1 else "medium"
+                            r.prov = "var-type"
+                            break
             # Tier 2 — free call resolves to a same-file definition, else through
             # an import binding of the called name to the defining file.
             if target is None and not e.recv:
