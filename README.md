@@ -99,6 +99,10 @@ python repograph.py . --impact analyze_bytes    # blast radius (transitive calle
 python repograph.py . --affected repograph.py   # which files/tests depend on these?
 python repograph.py . --affected                # …using git's changed files
 
+# Read the SOURCE in one call (no follow-up file open needed):
+python repograph.py . --node find_impact        # a symbol's source + caller/callee trail
+python repograph.py . --explore "resolve call edges"  # relevant symbols' source + call paths
+
 # Persist relationship edges (calls/extends/implements) into the map + json:
 python repograph.py /path/to/repo --edges -f md -o REPOMAP.md
 
@@ -143,6 +147,8 @@ It exposes these tools:
 | `callees` | **What a symbol calls** → `callee -> def path:line` (external/unresolved flagged). Args: `name`, `path?`, `limit?` |
 | `impact` | **Blast radius** of changing a symbol — its transitive callers, with affected test files called out. Args: `name`, `path?`, `max_depth?` |
 | `affected` | Given **changed files**, the files/tests that depend on them (tests first). Args: `files?` (array or comma string; omit for git changes), `path?` |
+| `node` | **Read a symbol without a follow-up file open** → its verbatim line-numbered **source** + caller/callee trail (confidence-tagged). Args: `name`, `path?`, `max_defs?`, `min_confidence?`/`strict?` |
+| `explore` | **Understand an area in one call** → the relevant symbols' **source** plus the call paths *between* them, from a set of names or a question. Args: `query`, `path?`, `max_files?`, `min_confidence?`/`strict?` |
 
 Register it by pointing any MCP client at `python3 .../repograph_mcp.py`:
 
@@ -253,7 +259,7 @@ any of the relationship queries, which turn it on automatically) to also extract
   the enclosing symbol so the graph is per-function, not per-file.
 - **`extends` / `implements`** — class/type inheritance from declaration headers.
 
-These power four queries, mirroring what a heavier code-intelligence tool gives
+These power these queries, mirroring what a heavier code-intelligence tool gives
 you, but kept honest about being approximate:
 
 | Query | Question it answers |
@@ -262,6 +268,18 @@ you, but kept honest about being approximate:
 | `--callees NAME` | What does `NAME` call? (definitions resolved; external calls flagged) |
 | `--impact NAME` | If I change `NAME`, what's the blast radius? (transitive callers, **affected tests flagged**) |
 | `--affected FILES` | Which files/tests depend on these changed files? (omit `FILES` to use git's changed set) |
+| `--node NAME` | Show me `NAME`'s **source** + its caller/callee trail (no follow-up file open) |
+| `--explore QUERY` | Show me the **source** of the symbols relevant to `QUERY` + the call paths between them |
+
+The last two return code, not just locations. Where `--callers`/`--find` route
+you to a `path:line` you then have to open, **`--node`** and **`--explore`** hand
+back the verbatim, line-numbered source (bodies capped ~80 lines, with an elision
+note) plus the surrounding calls — so an agent can answer "what does this do / how
+does it connect" in a single call. `--node` is one symbol and its trail;
+`--explore` takes names *or* a question, gathers the most relevant symbols
+(exact-name + lexical ranking, capped by `--max-files`), and shows the call edges
+that run *between* them. Both honor `--strict`/`--min-confidence` to drop
+low-confidence call-noise from the trail.
 
 Edges are stored **name-based and unresolved per file** (so the incremental cache
 stays correct — a file's edges depend only on that file), then **resolved at query

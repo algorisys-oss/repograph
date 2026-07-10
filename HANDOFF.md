@@ -232,6 +232,31 @@ adding deps; honest limits below.
    var-type → free-call local/import → name fallback. Remaining (deliberately
    out): full type inference (factory returns, reassignment, generics/overloads),
    framework dynamic-dispatch synthesis, and embeddings for semantic search.
+
+9. **`explore` / `node` — source-returning queries (2026-07-10)**, closing the
+   one agent-ergonomics gap vs. daemon-backed indexers like **codegraph**: every
+   other query returned a `path:line` that forced a follow-up Read, whereas
+   `codegraph explore`/`node` hand back the *source*. Now repograph does too, on
+   the existing index+resolved-edges, staying stdlib-only (no daemon/DB).
+   - **`node(repo, name)`** — the top N (default 3) definition sites' verbatim,
+     line-numbered source + caller (`<-`) / callee (`->`) trail, confidence-tagged.
+   - **`explore(repo, query, max_files)`** — resolves a query (identifier tokens
+     via `find_symbol` + lexical `search_symbols` ranking) to ≤`max_files`
+     symbols, prints each one's source, then the resolved call edges *between the
+     picked set* ("call paths between these symbols").
+   - Source slices use `Symbol.end` when the backend knew it (tree-sitter/ctags),
+     else fall back to next-symbol-start − 1; capped to `SOURCE_MAX_LINES` (80)
+     with an elision note. Helpers: `_symbol_span`, `_render_source`,
+     `_find_symbol_object`, `_files_by_rel`.
+   - CLI: `--node NAME`, `--explore QUERY`, `--max-files N` (all force edges on,
+     honor `--strict`/`--min-confidence` — strict cleanly drops the regex
+     backend's docstring-prose call false-positives from the trail).
+   - MCP: `node` + `explore` tools (now **ten** total). 9 new tests; **109 pass**
+     (10 ts-gated). Docs updated in README + skill/SKILL.md.
+   Deliberately NOT adopted from codegraph: the background daemon + SQLite index
+   (repograph's niche is the committed, zero-dep, human-readable map — a live
+   daemon would abandon that). Positioning stands: lightweight/committable vs.
+   codegraph's live/heavier indexer; the two don't integrate.
    Still deliberately out (would break the zero-dep default): **embeddings** for
    *true* semantic search. CJS `module.exports` names in the regex path also
    still missing.

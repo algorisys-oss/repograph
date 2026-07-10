@@ -810,6 +810,74 @@ class RelationshipQueryTest(unittest.TestCase):
         self.assertIn("no callees", rg.format_callee_rows([]))
 
 
+class ExploreNodeTest(unittest.TestCase):
+    """node / explore — the SOURCE-returning queries (close the gap vs a plain
+    path:line lookup that forces a follow-up file read)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        for rel, content in EDGE_FIXTURE.items():
+            p = self.root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        self.repo = rg.build_repo(self.root, use_ctags=False, edges=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_node_returns_source(self):
+        out = rg.node(self.repo, "main")
+        self.assertIn("core.py:5", out)          # location header
+        self.assertIn("return helper()", out)    # verbatim body line
+        self.assertIn("5 | def main", out)        # line-numbered source
+
+    def test_node_shows_call_trail(self):
+        out = rg.node(self.repo, "main")
+        self.assertIn("calls:", out)
+        self.assertIn("-> helper", out)          # callee resolved
+        self.assertIn("core.py:2", out)          # to its def
+
+    def test_node_shows_callers(self):
+        out = rg.node(self.repo, "helper")
+        self.assertIn("called by:", out)
+        self.assertIn("<- main", out)
+
+    def test_node_missing_symbol(self):
+        self.assertIn("no symbol", rg.node(self.repo, "nonesuch"))
+
+    def test_node_source_span_uses_end(self):
+        # helper is lines 2-3; its two source lines appear, main's do not.
+        out = rg.node(self.repo, "helper")
+        self.assertIn("2 | def helper", out)
+        self.assertIn("3 |     return 1", out)
+        self.assertNotIn("def main", out)
+
+    def test_explore_returns_source_and_paths(self):
+        out = rg.explore(self.repo, "main helper", max_files=4)
+        self.assertIn("== main", out)
+        self.assertIn("== helper", out)
+        self.assertIn("return helper()", out)                 # source included
+        self.assertIn("Call paths between these symbols:", out)
+        self.assertIn("main  ->  helper", out)                # edge between picked
+
+    def test_explore_max_files_caps_symbols(self):
+        out = rg.explore(self.repo, "helper main run render", max_files=1)
+        headers = [ln for ln in out.splitlines() if ln.startswith("== ")]
+        self.assertEqual(len(headers), 1)
+
+    def test_explore_empty_query(self):
+        self.assertIn("nothing relevant", rg.explore(self.repo, "zzz_no_such"))
+
+    def test_node_strict_drops_low_conf_prose(self):
+        # strict keeps only high-confidence trail edges: the resolved 'helper'
+        # callee survives, ambiguous/external name-noise is dropped.
+        out = rg.node(self.repo, "main", min_conf="high")
+        self.assertIn("-> helper", out)
+        self.assertNotIn("[low]", out)
+        self.assertNotIn("[medium]", out)
+
+
 @unittest.skipUnless(rg.tree_sitter_available(),
                      "tree-sitter grammar pack not installed")
 class TreeSitterBackendTest(unittest.TestCase):
