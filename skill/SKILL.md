@@ -160,6 +160,29 @@ python3 "$REPOGRAPH_PY" . --affected               # …using git's changed file
 - Resolution is best with `--tree-sitter` (exact receivers + scope); on the plain
   regex backend most edges land at medium/low confidence.
 
+## Read the code, not just its location (`--node` / `--explore`)
+
+The queries above route you to a `path:line` you then open. When you want to
+**see the source** without a follow-up read, use these — they return the
+verbatim, line-numbered code plus the calls around it:
+
+```bash
+python3 "$REPOGRAPH_PY" . --node find_impact           # one symbol's SOURCE + its
+                                                       #   caller/callee trail
+python3 "$REPOGRAPH_PY" . --node find_impact --strict  # trail: high-confidence only
+python3 "$REPOGRAPH_PY" . --explore "resolve call edges"   # relevant symbols' SOURCE
+python3 "$REPOGRAPH_PY" . --explore "build_repo render" --max-files 5
+```
+
+- `--node NAME` — the top few definition sites' source, each with what it
+  **calls** (`->`) and who **calls it** (`<-`), confidence-tagged. Reach for it
+  instead of `--find` + a Read when you actually want to inspect the code.
+- `--explore QUERY` — takes symbol names *or* a question, gathers the most
+  relevant symbols (exact-name + lexical ranking), prints each one's source, and
+  lists the **call paths between them** — grasp a feature in one shot.
+- Long bodies are capped (~80 lines) with an elision note pointing at the file.
+- Add `--strict` to drop low-confidence/prose call-noise from the trail.
+
 ## Precise backend (optional tree-sitter)
 
 For accurate symbols **and** call edges (attributed to the exact enclosing scope
@@ -172,10 +195,11 @@ just warns and falls back, so it's always safe to pass.
 
 This skill drives the CLI directly — that's all you need. Optionally, the same
 library is wrapped as a stdlib-only MCP server (`repograph_mcp.py` in the repo)
-exposing eight tools — `repo_index`, `find_symbol`, `search`, `find_refs`,
-`callers`, `callees`, `impact`, `affected` — for MCP clients (e.g. Google
-Antigravity) or sessions where calling a tool beats shelling out. If the
-`repograph` MCP tools are available, prefer `find_symbol` for "where is X
+exposing ten tools — `repo_index`, `find_symbol`, `search`, `find_refs`,
+`callers`, `callees`, `impact`, `affected`, `node`, `explore` — for MCP clients
+(e.g. Google Antigravity) or sessions where calling a tool beats shelling out. If
+the `repograph` MCP tools are available, prefer `find_symbol` for "where is X
 defined", `search` for by-intent, `find_refs` for "who uses X", `callers`/
-`callees`/`impact` for the call graph, and `repo_index` for routing. See the
-README's "Use as an MCP server" section.
+`callees`/`impact` for the call graph, `node`/`explore` when you want the
+**source** back in one call (not just a location), and `repo_index` for routing.
+See the README's "Use as an MCP server" section.

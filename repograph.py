@@ -2497,6 +2497,158 @@ def format_affected_rows(result) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# explore / node — hand back SOURCE + call trails, not just a location.
+#
+# The other query modes (find/callers/…) route you to a `path:line` you then
+# open. These return the verbatim source plus the calls around it, so an agent
+# can answer "what does this do / how does it connect" in one call, with no
+# follow-up file read. `node` is one symbol + its caller/callee trail; `explore`
+# is a set of relevant symbols + the call paths *between* them.
+# --------------------------------------------------------------------------- #
+
+SOURCE_MAX_LINES = 80   # per-symbol source cap; longer bodies are elided.
+
+
+def _files_by_rel(repo: Repo) -> dict:
+    return {f.rel_path: f for f in repo.files}
+
+
+def _symbol_span(fnode: FileNode, sym: Symbol):
+    """(start, end, truncated) 1-based line span of SYM's source. Uses the
+    recorded `end` when the backend knew it (tree-sitter/ctags); else falls back
+    to the line before the next symbol in the file. Capped to SOURCE_MAX_LINES,
+    with `truncated` flagging that the real body ran longer than shown."""
+    start = sym.line
+    if sym.end and sym.end >= start:
+        raw_end = sym.end
+    else:
+        after = [s.line for s in fnode.symbols if s.line > start]
+        raw_end = (min(after) - 1) if after else fnode.line_count
+        if raw_end < start:
+            raw_end = start
+    end = min(raw_end, start + SOURCE_MAX_LINES - 1)
+    return start, end, raw_end > end
+
+
+def _render_source(repo: Repo, cache: dict, fnode: FileNode, sym: Symbol) -> str:
+    """Line-numbered source slice for SYM. `cache` memoizes per-file reads."""
+    rel = fnode.rel_path
+    if rel not in cache:
+        try:
+            cache[rel] = read_lines(repo.root / rel)
+        except OSError:
+            cache[rel] = None
+    lines = cache[rel]
+    if lines is None:
+        return f"    (could not read {rel})"
+    start, end, truncated = _symbol_span(fnode, sym)
+    end = min(end, len(lines))
+    width = len(str(end))
+    out = [f"  {str(n).rjust(width)} | {lines[n - 1]}" for n in range(start, end + 1)]
+    if truncated:
+        out.append(f"  {'…'.rjust(width)} | … (elided; open {rel}:{start} for the rest)")
+    return "\n".join(out)
+
+
+def _find_symbol_object(fnode, line, name):
+    """The Symbol at LINE named NAME in FNODE (or the first at LINE)."""
+    if not fnode:
+        return None
+    exact = next((s for s in fnode.symbols if s.line == line and s.name == name), None)
+    return exact or next((s for s in fnode.symbols if s.line == line), None)
+
+
+def node(repo: Repo, name: str, max_defs: int = 3, min_conf: str = "low",
+         resolved=None) -> str:
+    """One symbol's verbatim source plus its caller/callee trail."""
+    frel = _files_by_rel(repo)
+    hits = find_symbol(repo, name)
+    want = _last(name)
+    exact = [h for h in hits if h[3] == name or _last(h[3]) == want]
+    hits = exact or hits
+    if not hits:
+        return f"(no symbol matching {name!r})"
+    resolved = resolve_edges(repo) if resolved is None else resolved
+    cache: dict = {}
+    out = []
+    for rel, line, kind, sym_name in hits[:max_defs]:
+        fnode = frel.get(rel)
+        sym = _find_symbol_object(fnode, line, sym_name)
+        out.append(f"== {sym_name}  ({kind})  {rel}:{line}")
+        if sym is not None:
+            out.append(_render_source(repo, cache, fnode, sym))
+        callees = find_callees(repo, sym_name, min_conf=min_conf, resolved=resolved)
+        if callees:
+            out.append("  calls:")
+            for callee, dr, dl, cl, conf in callees[:15]:
+                loc = f"{dr}:{dl}" if dr else "(external)"
+                tag = "" if conf == "high" else f" [{conf}]"
+                out.append(f"    -> {callee}  {loc}{tag}")
+        callers = find_callers(repo, sym_name, min_conf=min_conf, resolved=resolved)
+        if callers:
+            out.append("  called by:")
+            for crel, cline, caller, cl, conf in callers[:15]:
+                tag = "" if conf == "high" else f" [{conf}]"
+                out.append(f"    <- {caller}  {crel}:{cline}{tag}")
+        out.append("")
+    return "\n".join(out).rstrip() or f"(no symbol matching {name!r})"
+
+
+def explore(repo: Repo, query: str, max_files: int = 8, min_conf: str = "low",
+            resolved=None) -> str:
+    """Relevant symbols' source + the resolved call paths between them.
+
+    Resolves QUERY to symbols two ways — exact lookups for each identifier-like
+    token, then lexical `search` ranking to fill the rest — then prints each
+    one's source and the call edges that run *between* the selected symbols.
+    """
+    frel = _files_by_rel(repo)
+    picked: list = []
+    seen: set = set()
+
+    def add(rel, line, kind, nm):
+        if (rel, line) not in seen:
+            seen.add((rel, line))
+            picked.append((rel, line, kind, nm))
+
+    for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_.]+", query):
+        for rel, line, kind, nm in find_symbol(repo, tok, limit=5):
+            if nm.lower() == tok.lower() or _last(nm).lower() == _last(tok).lower():
+                add(rel, line, kind, nm)
+    for rel, line, kind, nm, _score in search_symbols(repo, query, limit=max_files * 3):
+        add(rel, line, kind, nm)
+    picked = picked[:max_files]
+    if not picked:
+        return f"(nothing relevant to {query!r})"
+
+    resolved = resolve_edges(repo) if resolved is None else resolved
+    cache: dict = {}
+    out = [f"Explore: {query}", f"{len(picked)} relevant symbol(s):", ""]
+    for rel, line, kind, nm in picked:
+        fnode = frel.get(rel)
+        sym = _find_symbol_object(fnode, line, nm)
+        out.append(f"== {nm}  ({kind})  {rel}:{line}")
+        if sym is not None:
+            out.append(_render_source(repo, cache, fnode, sym))
+        out.append("")
+
+    sites = {(rel, line) for rel, line, _, _ in picked}
+    names = {_last(nm) for _, _, _, nm in picked}
+    floor = CONF_RANK.get(min_conf, 1)
+    paths = set()
+    for r in resolved:
+        if CONF_RANK.get(r.conf, 0) < floor:
+            continue
+        if (r.dst_file, r.dst_line) in sites and _last(r.src) in names:
+            tag = "" if r.conf == "high" else f" [{r.conf}]"
+            paths.add(f"  {r.src}  ->  {r.dst}  ({r.src_file}:{r.call_line}){tag}")
+    if paths:
+        out.append("Call paths between these symbols:")
+        out.extend(sorted(paths))
+    return "\n".join(out).rstrip()
+
+
+# --------------------------------------------------------------------------- #
 # init — scaffold the committed-map integration into a consuming repo.
 # --------------------------------------------------------------------------- #
 
@@ -2753,6 +2905,15 @@ def main(argv=None) -> int:
                    help="print symbols called from within NAME (needs edges)")
     q.add_argument("--impact", metavar="NAME",
                    help="print the transitive callers of NAME — its blast radius")
+    q.add_argument("--node", metavar="NAME",
+                   help="print one symbol's SOURCE + its caller/callee trail "
+                        "(needs edges)")
+    q.add_argument("--explore", metavar="QUERY",
+                   help="print relevant symbols' SOURCE + the call paths between "
+                        "them, in one shot (names or a question; needs edges)")
+    q.add_argument("--max-files", type=int, default=8, dest="max_files",
+                   metavar="N",
+                   help="--explore: max symbols to include source for (default 8)")
     q.add_argument("--affected", nargs="?", const="", metavar="FILES",
                    help="print files/tests depending on FILES (comma-separated; "
                         "omit the value to use git's changed files)")
@@ -2788,7 +2949,8 @@ def main(argv=None) -> int:
     # The relationship queries need edges; force them on for those runs even if
     # --edges wasn't passed (the persisted artifact still honors --edges).
     edge_query = any(x is not None for x in
-                     (args.callers, args.callees, args.impact, args.affected))
+                     (args.callers, args.callees, args.impact, args.affected,
+                      args.node, args.explore))
     need_edges = args.edges or edge_query
 
     if args.tree_sitter and not tree_sitter_available():
@@ -2840,6 +3002,13 @@ def main(argv=None) -> int:
         changed = ([c.strip() for c in args.affected.split(",") if c.strip()]
                    if args.affected else git_changed_files(repo.root))
         print(format_affected_rows(find_affected(repo, changed)))
+        return 0
+    if args.node is not None:
+        print(node(repo, args.node, min_conf=min_conf))
+        return 0
+    if args.explore is not None:
+        print(explore(repo, args.explore, max_files=args.max_files,
+                      min_conf=min_conf))
         return 0
 
     rendered = RENDERERS[args.format](repo)
