@@ -12,6 +12,8 @@ It imports repograph in-process (no subprocess) and exposes these tools:
   - callees      — what a function/method calls
   - impact       — transitive callers (blast radius), tests flagged
   - affected     — files/tests depending on a set of changed files
+  - node         — one symbol's SOURCE + its caller/callee trail (no follow-up read)
+  - explore      — relevant symbols' SOURCE + the call paths between them
 
 All use an incremental per-repo cache so repeat calls are fast. The call-graph
 tools (callers/callees/impact/affected) build with relationship edges enabled.
@@ -168,6 +170,24 @@ def tool_affected(args) -> str:
     else:
         changed = rg.git_changed_files(repo.root)
     return rg.format_affected_rows(rg.find_affected(repo, changed))
+
+
+def tool_node(args) -> str:
+    name = (args.get("name") or "").strip()
+    if not name:
+        raise ValueError("'name' is required")
+    repo = _build_for_query(args, edges=True)
+    return rg.node(repo, name, max_defs=int(args.get("max_defs", 3)),
+                   min_conf=_min_conf(args))
+
+
+def tool_explore(args) -> str:
+    query = (args.get("query") or "").strip()
+    if not query:
+        raise ValueError("'query' is required")
+    repo = _build_for_query(args, edges=True)
+    return rg.explore(repo, query, max_files=int(args.get("max_files", 8)),
+                      min_conf=_min_conf(args))
 
 
 TOOLS = [
@@ -341,6 +361,62 @@ TOOLS = [
         },
     },
     {
+        "name": "node",
+        "description": (
+            "Read one symbol WITHOUT a follow-up file open: returns its verbatim "
+            "line-numbered SOURCE plus its caller/callee trail (what it calls, "
+            "who calls it — each tagged with confidence). Use this instead of "
+            "find_symbol+Read when you want to actually see the code. Names may be "
+            "qualified Owner.method; the top few definition sites are shown."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "function/class/method to read"},
+                "path": {"type": "string", "description": "Repo dir (default: cwd)"},
+                "max_defs": {"type": "integer",
+                             "description": "max definition sites to show (default 3)"},
+                "min_confidence": {"type": "string",
+                                   "enum": ["low", "medium", "high"],
+                                   "description": "confidence floor for the trail"},
+                "strict": {"type": "boolean",
+                           "description": "only high-confidence trail edges"},
+                "tree_sitter": {"type": "boolean",
+                                "description": "use tree-sitter for precise edges"},
+                "no_ctags": {"type": "boolean"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "explore",
+        "description": (
+            "Answer 'what does this area do / how does it connect' in ONE call: "
+            "given symbol names or a question, returns the relevant symbols' "
+            "verbatim SOURCE plus the resolved call paths BETWEEN them. Broader "
+            "than node (a set of symbols, not one); use it to understand a "
+            "feature without opening several files. max_files caps how many "
+            "symbols' source is included."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "symbol names or a question, e.g. "
+                                         "'how are call edges resolved'"},
+                "path": {"type": "string", "description": "Repo dir (default: cwd)"},
+                "max_files": {"type": "integer",
+                              "description": "max symbols to include source for (default 8)"},
+                "min_confidence": {"type": "string",
+                                   "enum": ["low", "medium", "high"]},
+                "strict": {"type": "boolean"},
+                "tree_sitter": {"type": "boolean"},
+                "no_ctags": {"type": "boolean"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "affected",
         "description": (
             "Given changed files, list the files (tests first) that depend on "
@@ -369,6 +445,8 @@ DISPATCH = {
     "callees": tool_callees,
     "impact": tool_impact,
     "affected": tool_affected,
+    "node": tool_node,
+    "explore": tool_explore,
 }
 
 
