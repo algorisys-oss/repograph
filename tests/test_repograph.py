@@ -6,6 +6,7 @@ or:
     python repograph/tests/test_repograph.py
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -673,6 +674,37 @@ class InitTest(unittest.TestCase):
         index = (self.root / ".repograph" / "index.txt").read_text()
         self.assertIn("src/app.py", index)
         self.assertNotIn("tests/t.py", index)
+
+    def test_init_writes_portable_mcp_config(self):
+        rg.cmd_init(self.root, include=None, exclude=None,
+                    symbols_level="defs", use_ctags=False)
+        cfg = json.loads((self.root / ".mcp.json").read_text())
+        server = cfg["mcpServers"]["repograph"]
+        self.assertEqual(server["command"], "node")
+        # a consumer repo (no repograph_mcp.py in-tree) resolves via node_modules
+        self.assertEqual(server["args"],
+                         ["node_modules/repograph/bin/repograph-mcp.js"])
+
+    def test_init_self_repo_uses_in_tree_launcher(self):
+        (self.root / "repograph_mcp.py").write_text("# self\n")
+        rg.cmd_init(self.root, include=None, exclude=None,
+                    symbols_level="defs", use_ctags=False)
+        server = json.loads((self.root / ".mcp.json").read_text())["mcpServers"]["repograph"]
+        self.assertEqual(server["args"], ["bin/repograph-mcp.js"])
+
+    def test_init_no_mcp_skips_config(self):
+        rg.cmd_init(self.root, include=None, exclude=None,
+                    symbols_level="defs", use_ctags=False, mcp=False)
+        self.assertFalse((self.root / ".mcp.json").exists())
+
+    def test_init_merges_existing_mcp_config(self):
+        (self.root / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"other": {"command": "x"}}}))
+        rg.cmd_init(self.root, include=None, exclude=None,
+                    symbols_level="defs", use_ctags=False)
+        servers = json.loads((self.root / ".mcp.json").read_text())["mcpServers"]
+        self.assertIn("other", servers)        # preserved
+        self.assertIn("repograph", servers)    # added
 
     def test_init_non_git_errors(self):
         with tempfile.TemporaryDirectory() as d:

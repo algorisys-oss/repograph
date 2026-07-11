@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "repograph": {
+      "command": "node",
+      "args": [
+        "bin/repograph-mcp.js"
+      ]
+    }
+  }
+}

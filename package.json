@@ -10,7 +10,8 @@
     "url": "git+https://github.com/algorisys-oss/repograph.git"
   },
   "bin": {
-    "repograph": "bin/repograph.js"
+    "repograph": "bin/repograph.js",
+    "repograph-mcp": "bin/repograph-mcp.js"
   },
   "files": [
     "bin/",

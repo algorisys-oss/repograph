@@ -48,11 +48,26 @@ npx repograph init --include 'src/*' --exclude '*test*'   # scoped (baked into t
 
 `init` writes `.repograph/{index.txt,map.md,graph.json}`, installs a tracked
 `.githooks/pre-commit` that refreshes the map and `git add`s it on every commit,
-and points `core.hooksPath` at `.githooks`. The map is then **committed with your
+points `core.hooksPath` at `.githooks`, and registers the MCP server via a
+committed `.mcp.json` (see below). The map is then **committed with your
 code**, so a fresh clone has it immediately — reading the map needs no Python at
 all; only refreshing does. The hook resolves the tool through the consumer's own
 `node_modules/.bin/repograph`, so it works in any repo that depends on repograph,
 and no-ops cleanly when the tool isn't installed (e.g. before `npm install`).
+
+`init` also writes a project-scoped **`.mcp.json`** that registers the
+`repograph` MCP server (`node node_modules/repograph/bin/repograph-mcp.js`, run
+from the repo root). So any MCP client that opens the repo — e.g. Claude Code —
+gets the `repograph:*` tools (`explore`, `find_symbol`, …) with **zero manual
+setup**, and every use shows as a visible tool call in the chat. The path is
+portable (resolved through the consumer's `node_modules`, no machine-specific
+absolute paths), so it travels to teammates and fresh clones. An existing
+`.mcp.json` is merged, not clobbered. Pass `--no-mcp` to skip it — e.g. if you'd
+rather register repograph once at user scope so it applies to *all* your repos:
+
+```bash
+claude mcp add --scope user repograph -- python3 /abs/path/to/repograph_mcp.py
+```
 
 To make the hook auto-activate for everyone who clones, add to `package.json`:
 
@@ -60,8 +75,8 @@ To make the hook auto-activate for everyone who clones, add to `package.json`:
 "scripts": { "prepare": "git config core.hooksPath .githooks" }
 ```
 
-Commit `.repograph/` and `.githooks/`. (Without npm, `tools/install-git-hook.sh`
-does the same via the in-source tool.)
+Commit `.repograph/`, `.githooks/`, and `.mcp.json`. (Without npm,
+`tools/install-git-hook.sh` does the same via the in-source tool.)
 
 ## Usage
 

@@ -1,0 +1,15 @@
+#!/bin/sh
+# >>> repograph >>>
+# Managed by `repograph init` — refreshes the committed repo map and stages it.
+# No-op if repograph isn't installed, so it never blocks a commit.
+set -e
+ROOT=$(git rev-parse --show-toplevel)
+if   [ -n "${REPOGRAPH:-}" ]; then RG="$REPOGRAPH"
+elif [ -x "$ROOT/node_modules/.bin/repograph" ]; then RG="$ROOT/node_modules/.bin/repograph"
+elif command -v repograph >/dev/null 2>&1; then RG=repograph
+else exit 0
+fi
+"$RG" "$ROOT" -f index -o "$ROOT/.repograph/index.txt" --cache "$ROOT/.repograph/graph.json" >/dev/null 2>&1 || exit 0
+"$RG" "$ROOT" -f md    -o "$ROOT/.repograph/map.md"    --cache "$ROOT/.repograph/graph.json" >/dev/null 2>&1 || exit 0
+git add "$ROOT/.repograph" 2>/dev/null || true
+# <<< repograph <<<
