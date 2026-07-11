@@ -2692,14 +2692,54 @@ def _scope_flags(include, exclude, edges=False, use_tree_sitter=False) -> str:
     return (" " + " ".join(parts)) if parts else ""
 
 
+def _write_mcp_config(repo: Path) -> str:
+    """Scaffold/merge a project-scoped `.mcp.json` that registers the repograph
+    MCP server, so any MCP client opening the repo (e.g. Claude Code) gets the
+    `repograph:*` tools with zero manual setup — and the config travels with the
+    repo for teammates and fresh clones.
+
+    The server command is portable: it resolves the launcher through the
+    consumer's own node_modules (`node node_modules/repograph/bin/repograph-mcp.js`,
+    run from the project root as cwd), so it works on any machine where repograph
+    is an npm dependency — no absolute, machine-specific paths. When the repo IS
+    repograph itself, it points at the in-tree launcher instead. Returns a short
+    status word for the caller to report.
+    """
+    # In-repo (repograph's own tree) vs. consumer (repograph as an npm dep).
+    if (repo / "repograph_mcp.py").exists():
+        args = ["bin/repograph-mcp.js"]
+    else:
+        args = ["node_modules/repograph/bin/repograph-mcp.js"]
+    server = {"command": "node", "args": args}
+
+    path = repo / ".mcp.json"
+    data: dict = {}
+    status = "wrote"
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            status = "updated"
+        except (OSError, ValueError):
+            data, status = {}, "wrote"  # unreadable/garbage — overwrite fresh
+    servers = data.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        servers = data["mcpServers"] = {}
+    if servers.get("repograph") == server:
+        status = "unchanged"
+    servers["repograph"] = server
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return status
+
+
 def cmd_init(repo: Path, include, exclude, symbols_level: str,
              use_ctags: bool, use_tree_sitter: bool = False,
-             edges: bool = False) -> int:
+             edges: bool = False, mcp: bool = True) -> int:
     """Scaffold the committed-map workflow into `repo`:
 
       1. build the initial .repograph/ map (index.txt + map.md + graph.json),
       2. write a tracked .githooks/pre-commit that refreshes + stages it,
-      3. activate it locally (core.hooksPath), and print how to make it
+      3. register the MCP server via a portable .mcp.json (unless mcp=False),
+      4. activate the hook locally (core.hooksPath), and print how to make it
          auto-activate for everyone who clones.
     """
     repo = repo.resolve()
@@ -2729,7 +2769,10 @@ def cmd_init(repo: Path, include, exclude, symbols_level: str,
         encoding="utf-8")
     hook.chmod(0o755)
 
-    # 3. Activate for the current clone.
+    # 3. Register the MCP server via a portable, committed .mcp.json.
+    mcp_status = _write_mcp_config(repo) if mcp else None
+
+    # 4. Activate for the current clone.
     activated = False
     try:
         subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath",
@@ -2738,17 +2781,21 @@ def cmd_init(repo: Path, include, exclude, symbols_level: str,
     except (OSError, subprocess.CalledProcessError):
         pass
 
-    # 4. Report + how to make it auto-activate on every clone.
+    # 5. Report + how to make it auto-activate on every clone.
     n = len(graph.files)
     print(f"repograph init: wrote .repograph/ ({n} files) + .githooks/pre-commit",
           file=sys.stderr)
+    if mcp_status is not None:
+        print(f"  .mcp.json {mcp_status} -> registers the `repograph` MCP server "
+              "(node node_modules/repograph/bin/repograph-mcp.js)", file=sys.stderr)
     print("  core.hooksPath -> .githooks " +
           ("(set)" if activated else "(set it manually: git config core.hooksPath .githooks)"),
           file=sys.stderr)
     if (repo / "package.json").exists():
         print('  to auto-activate after clone, add to package.json scripts:\n'
               '    "prepare": "git config core.hooksPath .githooks"', file=sys.stderr)
-    print("  commit .repograph/ and .githooks/ so the map travels with the repo.",
+    committed = ".repograph/, .githooks/" + (", and .mcp.json" if mcp_status is not None else "")
+    print(f"  commit {committed} so the map travels with the repo.",
           file=sys.stderr)
     return 0
 
@@ -2931,6 +2978,11 @@ def main(argv=None) -> int:
              "activate it. Respects --include/--exclude/--symbols (baked into "
              "the hook).",
     )
+    parser.add_argument(
+        "--no-mcp", action="store_true", dest="no_mcp",
+        help="with --init, skip writing/updating .mcp.json (which otherwise "
+             "registers the repograph MCP server for the project).",
+    )
     args = parser.parse_args(argv)
 
     if not args.repo.is_dir():
@@ -2944,7 +2996,8 @@ def main(argv=None) -> int:
     if args.init:
         return cmd_init(args.repo, include=args.include, exclude=args.exclude,
                         symbols_level=args.symbols, use_ctags=not args.no_ctags,
-                        use_tree_sitter=args.tree_sitter, edges=args.edges)
+                        use_tree_sitter=args.tree_sitter, edges=args.edges,
+                        mcp=not args.no_mcp)
 
     # The relationship queries need edges; force them on for those runs even if
     # --edges wasn't passed (the persisted artifact still honors --edges).
