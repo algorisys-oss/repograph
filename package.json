@@ -13,6 +13,9 @@
     "repograph": "bin/repograph.js",
     "repograph-mcp": "bin/repograph-mcp.js"
   },
+  "scripts": {
+    "prepare": "git config core.hooksPath .githooks"
+  },
   "files": [
     "bin/",
     "repograph.py",
