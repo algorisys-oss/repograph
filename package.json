@@ -14,7 +14,7 @@
     "repograph-mcp": "bin/repograph-mcp.js"
   },
   "scripts": {
-    "prepare": "git config core.hooksPath .githooks"
+    "prepare": "node bin/setup-hooks.js"
   },
   "files": [
     "bin/",
